@@ -2,25 +2,15 @@
 """
 DSP56800E firmware decoder for the 4b/8b line-coded, 168-byte-framed format.
 
-File format (verified from real frame data):
-    Stream of frames, each structured as:
-        [sync 4][FFFF-marker 4][metadata 4][payload 152][tag 4] = 168 bytes
-    where:
-        sync         = one of {99 56 87 68, 99 55 83 68, 99 56 83 68}
-        FFFF-marker  = constant 9c 66 1b a5 (one codeword, decodes to 0xFFFF)
-        metadata     = 4 bytes that are NOT in the codeword alphabet;
-                       likely a destination flash address or frame counter
-        payload      = 38 codewords = 38 16-bit DSP words = 76 bytes of
-                       decoded program data
-        tag          = ?? ?? 26 9F  (or BF 53 with disparity flip);
-                       last 4 bytes of frame; bytes 0,1 are variable
-                       (possibly checksum or sub-frame counter)
-
-    Most frames are standard 168 bytes.  A few are anomalous: the first
-    frame is typically 40 bytes (starting boundary header), the last is
-    often truncated, and occasional mid-file 232-byte frames may occur.
-    A small leading file header (e.g., a version string) may precede
-    the first sync; the decoder skips over it automatically.
+File format (from analysis):
+    Stream of frames separated by 4-byte sync.  Each frame's structure is:
+        [sync : 4][payload : N-8][tag : 4]
+    where N is the frame size.  Most frames are standard 168-byte ones
+    (160-byte payload = 40 codewords).  The first frame is typically a
+    40-byte boundary header (32-byte payload).  The last frame is often
+    truncated (typically 108 bytes, 100-byte payload).  A small leading
+    file header (e.g., 13 bytes of version string) may precede the first
+    sync; the decoder skips over it automatically.
 
 Encoding:
     Each 4-byte payload codeword carries one 16-bit DSP word using a
@@ -30,28 +20,31 @@ Encoding:
         pos 0 mask 0x66, pos 1 mask 0x33,
         pos 2 mask 0x99, pos 3 mask 0xCC.
     Each XOR pair represents one logical nibble (0..F); the encoder
-    picks polarity to balance the running 0/1 disparity.
+    picks polarity to balance the running 0/1 disparity.  The 4-byte
+    tag at the end of each frame uses an extension pair at positions
+    2 and 3 (markers 0x26/0xBF and 0x9F/0x53), with positions 0,1
+    carrying frame metadata in the regular alphabet.
 
 Decoding pipeline:
-    1. find_frames        — locate every sync, parse frame fields.
-    2. strip_framing      — concatenate payload bytes (drop sync,
-                            FFFF-marker, metadata, and tag from each).
+    1. find_frames        — locate every sync.
+    2. strip_framing      — concatenate payload bytes (skip sync at start
+                            and tag at end of each frame).
     3. decode_pair_indices — bytes → pair-id (0..15) tuples.
     4. derive_mappings    — pair-id → nibble (needs anchors).
     5. apply_mappings     — produce final 16-bit words.
 
 What is fully known:
-    Frame structure, sync bytes, the 32-byte codeword alphabet at
-    every byte position, and the XOR-pair structure.  Stages 1–3 are
+    Frame structure, sync/tag bytes, the 32-byte alphabet at every
+    byte position, and the XOR-pair structure.  Stages 1–3 are
     deterministic and need no extra information.
 
 What requires anchors:
     The bijection pair-id → nibble at each of the four positions
     cannot be determined from the histogram alone.  Pass anchors
-    (codeword-index, expected-word) to derive_mappings.  Reliable
-    anchors include 0xFFFF (erased flash, found via --find-runs)
-    and the JMP/JSR opcodes 0xE154/0xE254 at the start of the
-    vector table (see DSP56800E reference manual).
+    (codeword-index, expected-word) to derive_mappings.  Recommended
+    anchor: the SECL_VALUE = 0xE70A appearing 8 words from the top of
+    program flash (see the MC56F8300 Flash Memory chapter, Table 6-7
+    and Section 6.5.4).
 """
 
 from __future__ import annotations
@@ -70,15 +63,10 @@ from typing import Iterable, Sequence
 # ============================================================================
 
 SYNC_LEN = 4
-FFFF_MARKER_LEN = 4    # The constant 4-byte FFFF codeword (9c 66 1b a5)
-METADATA_LEN = 4       # 4 bytes of frame metadata (not a codeword)
 TAG_LEN = 4
-FRAMING = SYNC_LEN + FFFF_MARKER_LEN + METADATA_LEN + TAG_LEN  # 16 bytes
+FRAMING = SYNC_LEN + TAG_LEN
 STD_FRAME_SIZE = 168
-STD_PAYLOAD_SIZE = STD_FRAME_SIZE - FRAMING  # 152 bytes = 38 codewords
-
-# The FFFF marker bytes (constant for all frames)
-FFFF_MARKER = b"\x9c\x66\x1b\xa5"
+STD_PAYLOAD_SIZE = STD_FRAME_SIZE - FRAMING  # 160 bytes = 40 codewords
 
 # All sync values observed in the analysed file.
 VALID_SYNCS = {
@@ -205,25 +193,15 @@ def find_frames(data: bytes,
                else end_offset)
         size = end - start
         sync = bytes(data[start:start + SYNC_LEN])
-        # New layout (verified from real frame data):
-        #   [sync 4][FFFF-marker 4][metadata 4][payload N-16][tag 4]
-        # The FFFF-marker is the constant 4-byte sequence 9c 66 1b a5 (= one
-        # codeword whose pair-ids decode to 0xFFFF).  The metadata is 4 bytes
-        # NOT in the codeword alphabet — likely the destination flash address
-        # or a frame counter.  Tag occupies the last 4 bytes of the frame.
-        if size >= SYNC_LEN + FFFF_MARKER_LEN + METADATA_LEN + TAG_LEN:
-            ffff_marker = bytes(data[start + SYNC_LEN
-                                     :start + SYNC_LEN + FFFF_MARKER_LEN])
-            metadata = bytes(data[start + SYNC_LEN + FFFF_MARKER_LEN
-                                  :start + SYNC_LEN + FFFF_MARKER_LEN + METADATA_LEN])
-            payload_start = start + SYNC_LEN + FFFF_MARKER_LEN + METADATA_LEN
-            payload_size = size - (SYNC_LEN + FFFF_MARKER_LEN + METADATA_LEN
-                                   + TAG_LEN)
+        # Payload sits between sync and tag.  Tag is the last 4 bytes
+        # of the frame (immediately before the next sync, or before EOF
+        # for the last frame).  If the frame is short enough that
+        # there's no room for both, treat it as sync-only.
+        if size >= SYNC_LEN + TAG_LEN:
+            payload_start = start + SYNC_LEN
+            payload_size = size - SYNC_LEN - TAG_LEN
             tag = bytes(data[end - TAG_LEN:end])
         else:
-            # Frame too short for the full structure; treat conservatively.
-            ffff_marker = b""
-            metadata = b""
             payload_start = start + SYNC_LEN
             payload_size = max(0, size - SYNC_LEN)
             tag = b""
@@ -233,8 +211,6 @@ def find_frames(data: bytes,
             "end": end,
             "frame_size": size,
             "sync": sync,
-            "ffff_marker": ffff_marker,
-            "metadata": metadata,
             "tag": tag,
             "payload_start": payload_start,
             "payload_size": payload_size,
@@ -761,24 +737,6 @@ def _info(data: bytes,
         print(f"  WARNING: {bad_tag} frame(s) with unexpected tag marker — "
               f"frame boundaries may be wrong", file=sys.stderr)
 
-    # FFFF-marker validation
-    ffff_ok = sum(1 for f in frames if f.get("ffff_marker") == FFFF_MARKER)
-    ffff_other = len(frames) - ffff_ok
-    print(f"FFFF-marker (bytes 4-7 of frame): {ffff_ok}/{len(frames)} match "
-          f"the constant 9c 66 1b a5", file=sys.stderr)
-    if ffff_other:
-        print(f"  {ffff_other} frame(s) had a different value — investigate",
-              file=sys.stderr)
-
-    # Sample of metadata fields (first 5 standard frames)
-    std_frames = [f for f in frames if f["is_standard"]]
-    if std_frames:
-        print(f"sample metadata fields (first 5 standard frames):",
-              file=sys.stderr)
-        for f in std_frames[:5]:
-            print(f"  frame {f['index']:>4}: metadata = {f['metadata'].hex(' ')}",
-                  file=sys.stderr)
-
     print(f"payload after strip: {len(payload)} bytes "
           f"({len(pair_rows)} codewords)", file=sys.stderr)
     print(f"max decoded size   : {2 * len(pair_rows)} bytes "
@@ -859,6 +817,11 @@ def main(argv=None) -> int:
                          "consistency and report nibble coverage")
     ap.add_argument("--only-standard", action="store_true",
                     help="exclude anomalous frames from decode")
+    ap.add_argument("--drop-leading", type=int, default=0, metavar="N",
+                    help="drop N leading bytes (multiple of 4) from each "
+                         "standard frame's payload before decoding. Use "
+                         "8 to remove the 2 leading 0xFFFF padding words "
+                         "that prefix every standard frame in this format.")
     args = ap.parse_args(argv)
 
     data = Path(args.input).read_bytes()
@@ -866,7 +829,8 @@ def main(argv=None) -> int:
 
     frames = find_frames(data, start_offset=args.skip, end_offset=args.end)
     payload, frames, anomalous = strip_framing(
-        data, frames, only_standard=args.only_standard)
+        data, frames, only_standard=args.only_standard,
+        drop_leading_per_frame=args.drop_leading)
     print(f"[+] {len(frames)} frames; payload after strip: "
           f"{len(payload)} bytes", file=sys.stderr)
 
