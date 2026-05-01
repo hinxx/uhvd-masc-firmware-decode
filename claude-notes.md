@@ -2142,3 +2142,99 @@ Then do a full decode and look at the bytes after the vector table (offset 0x154
 
 About the FFFFs near the end: those are likely the **erased flash trailer**. Every CodeWarrior-built firmware has FFFF padding at the end of program flash up to the configuration field. The fact that some bytes aren't quite FFFF tells us the heuristic is decoding those positions wrong — adding more anchors will progressively fix them.
 
+Wait — something interesting just happened. Look closely:
+
+- Before adding the 0x7015 anchor: **74 vectors targeted 0x7015**
+- After adding the 0x7015 anchor: only **1 vector targets 0x7015**, and **74 vectors target 0x7025** instead!
+
+The anchor is consistent with our existing anchors, so it didn't contradict anything — but the act of pinning a *new* pair-id at codeword 17 as `0x7015` changed the heuristic guess for some other pair-id, which flipped what 74 codewords decode to.
+
+Let me think about what just happened:This is a really important finding. Adding the `0x7015` anchor *did* propagate consistently — but it also revealed that **vector 5's target codeword has different pair-ids than the 74 default-handler codewords**.
+
+That means before our anchor, the heuristic was *guessing* both pair-id sets to map to nibbles that gave `0x7015`, but in reality at least one of those guesses was wrong. The new constraint forces them apart, and now we see two different decoded values.
+
+Here's what changed in the vector table:
+
+| Before | After | Vector |
+|---|---|---|
+| 0x7015 (×74 default) | 0x7025 (×74 default) | 6-19, 22-77, 79-81 |
+| 0xB015 | 0xB025 | 21 |
+| 0x7015 | 0x7015 | 5 only |
+
+So either:
+- Vector 5 really is special (a real handler at `0x7015`), and the others are at `0x7025`, OR
+- Vector 5 isn't `0x7015` either, and we anchored it wrong
+
+Let me reason structurally. **Looking at the Freescale 56F834x vector table you uploaded earlier**, vector slots and their meaning:Now I understand the vector layout:
+
+| Vec # | Source | Handler |
+|---|---|---|
+| 0 | RESET | `Finit_MC56F83xx_` (startup) |
+| 1 | COP Watchdog | `intRoutine` (default) |
+| 2 | illegal instruction | `illegal` (specific) |
+| 3 | software interrupt 3 | `intRoutine` (default) |
+| 4 | hardware stack overflow | `HWSOverflow` (specific) |
+| 5 | misaligned long word access | `misalign` (specific) |
+| 6+ | various interrupts | mostly `intRoutine` |
+| 20 | Low Voltage Detector | `PLL` (specific) |
+| 21 | PLL | `intRoutine` (default) |
+
+So in the **standard Freescale layout**, **vector 5 should point to a SPECIFIC handler** (`misalign`), not the default. Let me match this against our decoded vectors:
+
+| Vec | Decoded target | Freescale role | Match? |
+|---|---|---|---|
+| 0 | 0xDF5F | Finit_MC56F83xx_ | ✓ specific |
+| 1 | 0xDF5F | intRoutine | reset jumps to same place as 0 — common in custom code |
+| 2 | 0x7075 | illegal | ✓ specific |
+| 3 | 0x7025 | intRoutine | ✓ default |
+| 4 | 0x70D5 | HWSOverflow | ✓ specific |
+| 5 | **0x7015** | misalign | **✓ specific!** |
+| 6+ | 0x7025 | mostly intRoutine | ✓ default |
+
+**Vector 5 IS supposed to be a specific handler!** It's the misalign handler, not the default. So our decode is now structurally consistent with the Freescale spec:
+
+- 5 specific handlers at `0xDF5F` (Finit), `0x7075` (illegal), `0x70D5` (HWSOverflow), `0x7015` (misalign), `0x7085` (?), `0x98AF` (LVD), `0xB025` (?)
+- 74 default handlers at `0x7025` (= `intRoutine`)
+- Vector 78 at `0x01FF` is still suspicious though — should be a default
+
+Let me verify this with one more anchor — vector 6's target should also be the "default" `intRoutine`:## Where we are
+
+The vector table is now structurally aligned with the Freescale 56F834x reference:
+
+| Vector | Target | Role |
+|---|---|---|
+| 0 | 0xDF5F | RESET → `Finit_MC56F83xx_` |
+| 1 | 0xDF5F | COP → same handler (custom firmware quirk) |
+| 2 | 0x7075 | illegal instruction handler |
+| 3 | 0x7025 | software interrupt 3 (default) |
+| 4 | 0x70D5 | HW stack overflow handler |
+| 5 | **0x7015** | misaligned access handler (**specific**, not default!) |
+| 6-19 | 0x7025 | various defaults |
+| 20 | 0x98AF | LVD handler |
+| 21 | 0xB025 | PLL (interesting — different region) |
+| 22-77, 79-81 | 0x7025 | defaults |
+| 78 | 0x01FF | **still suspicious** |
+
+**Vector 5 turning out to be specific** matches the Freescale spec where vector 5 = misaligned-access handler. Our anchor was correct, and the decoder is now revealing that there are **6 specific handlers and 74 default handlers** in this firmware, not 4-5 specific as I initially thought.
+
+## Next anchor: pin the default handler
+
+```bash
+echo '[[41124, "0xFFFF"], [6, "0xE154"], [10, "0xE254"], [17, "0x7015"], [19, "0x7025"]]' > anchors.json
+python3 dsp56800e_decoder.py firmware.elf.e --skip 13 \
+    --anchors anchors.json --nibble-order 0231 --check-anchors
+```
+
+**Expected outcome:** `Consistent: True` with ~17 nibbles pinned (4 + 4 + 4 + 5 across positions). Adding cw 19 = `0x7025` (the default handler address) is a strong anchor because **74 different codewords share these exact pair-ids** — pinning them propagates correctness across all those vectors.
+
+Then re-decode and you should see:
+- Vector 78 hopefully resolves to `0x7025` (if the heuristic was just guessing wrong there)
+- The boundary frame's 6 words may sharpen
+- Many "almost FFFF" patterns near the end of the file should resolve to true `0xFFFF`
+
+If vector 78 *still* shows `0x01FF` after this, then it's genuinely a special target — but I doubt it, because the structural pattern (74 vectors all the same, 1 vector at index 78 different) screams "heuristic miscoding" rather than "intentional handler".
+
+After that anchor, the next strong candidate would be **anchoring `0xDF5F`** (the reset handler at vector 0/1's target, codeword 7), which is uniquely a 5-nibble identifier — but D, F, 5, F mostly overlap with already-pinned pair-ids, so it might not add many new pins.
+
+A more productive direction once we have ~20 pinned nibbles: look at **the actual code at the start of `_startup`** somewhere in the decoded output. Once the basic mapping stabilizes, you can find the address `0xDF5F` content in the decoded.bin and use opcode patterns from the Freescale `init.asm` file you uploaded earlier as additional anchors.
+
