@@ -2006,3 +2006,139 @@ Let me also look at the bytes following to see if there are more sync variants w
 
 Let me also clean up the now-unused `VALID_SYNCS` constant and update output:
 
+## What was wrong and what's now fixed
+
+You were 100% right. There **are** 82 vectors, and my decoder was missing 26 of them. The cause:
+
+**Frame 5 in your file has a sync value `99 56 83 1D`** — different from the three I had hardcoded (`99 56 87 68`, `99 55 83 68`, `99 56 83 68`). My `find_frames` rejected it, so all 12 codewords (containing 6 JSRs) of that frame were silently dropped from the payload. The vector table was further continued in the next frame, and `find_frames` resumed from there — but with frame 5 missing, the codewords landed at wrong indices and the apparent table ended early.
+
+**The fix:** detect frames by the constant FFFF marker (`9c 66 1b a5`) at offset +4 from the sync, rather than by enumerating known sync byte sequences. The marker is **constant across every frame** — verified across all 1148 frames in your CSV — making it a far more reliable signature than the sync itself, which apparently varies by frame type.
+
+After the fix, running `find_frames` on the bytes from your `0x320.txt` correctly identifies **all 7 frames** (including the previously-missed frame 5 at `0x02C8` with sync `99 56 83 1D`), and the decoded payload contains exactly **2 JMPs + 80 JSRs = 82 vectors** — matching the Freescale spec.
+
+## What it tells us about the format
+
+The sync byte sequence isn't a magic constant — it carries **information** that the encoder uses to mark frame types. Three variants observed so far:
+
+| Sync | Frame type |
+|---|---|
+| `99 56 87 68` | Standard 168-byte frame (the bulk of the file) |
+| `99 55 83 68` | Boundary frame at file start |
+| `99 56 83 68` | Boundary frame at file end |
+| `99 56 83 1D` | Special interior frame (in your firmware, partway through the vector table) |
+
+Looking at the byte differences:
+- `87 → 83` flips bit 2 of byte 2
+- `68 → 1D` is a wholesale change of byte 3
+
+These look like flag bits encoding: "is this a section boundary?" and possibly "what type of memory follows?". The mid-file `99 56 83 1D` frame in your firmware comes right at the **boundary between vector table and code** — frame 5 contains the last 6 vector entries plus possibly a section-change marker. So the sync byte 3 might encode "this frame ends a section" or "destination memory region changes here".
+
+## Re-decode now
+
+You'll need to re-run with the fixed decoder. Codeword indices have shifted because frame 5 is no longer dropped, so your existing FFFF anchor at index 41074 is wrong. Find the new one:
+
+```bash
+python3 dsp56800e_decoder.py firmware.elf.e --skip 13 --find-runs 10
+```
+
+Update anchors:
+
+```bash
+echo '[[<NEW_FFFF_INDEX>, "0xFFFF"], [6, "0xE154"], [10, "0xE254"]]' > anchors.json
+```
+
+Verify:
+
+```bash
+python3 dsp56800e_decoder.py firmware.elf.e --skip 13 \
+    --anchors anchors.json --nibble-order 0231 --check-anchors
+```
+
+Should be `Consistent: True` with 9 pinned (2/2/2/3 across positions). Then full decode:
+
+```bash
+python3 dsp56800e_decoder.py firmware.elf.e --skip 13 \
+    --anchors anchors.json --nibble-order 0231 --byte-order little \
+    -o decoded.bin
+hexdump -Cv decoded.bin | head -100
+```
+
+You should now see **all 82 vectors** decoded as `54 e1 ?? ??` (JMP) and `54 e2 ?? ??` (JSR) entries spanning roughly bytes `0x0C` through `0x154` (= 0xC + 82×4) of decoded.bin, followed by real code.
+
+
+Excellent — there's a wealth of new information here. Let me work through what's solid and what's still misleading.
+
+## What we definitively know now
+
+**The vector table is fully decoded** — 82 entries, 2 JMP + 80 JSR, exactly as predicted. The handler addresses cluster as expected:
+
+| Target | Count | Likely meaning |
+|---|---|---|
+| `0x7015` | 74 | Default "do nothing" handler |
+| `0xDF5F` | 2 | Reset + COP reset → `_startup` |
+| `0x7075` | 1 | One specific interrupt handler |
+| `0x70D5` | 1 | Another |
+| `0x7085` | 1 | Another |
+| `0x98AF` | 1 | Another |
+| `0xB015` | 1 | Another |
+| `0x01FF` | 1 | **Suspicious** |
+
+**That `0x01FF` target is almost certainly wrong.** Every other handler address is in plausible code regions (`0x7000-0x70FF`, `0x98xx`, `0xB0xx`, `0xDF5F`). `0x01FF` would be in low memory where there's no code. This entry's pair-ids must contain at least one heuristic-wrong nibble.
+
+## Your observation about FFFFs at the end is the key insight
+
+You're absolutely right. Looking at the tail of the decoded file, I see lots of bytes that *should* be `0xFF` but aren't quite. Let me analyze:Hmm — this is more nuanced than I'd hoped. The "almost FFFF" patterns are **distributed across many different wrong-nibble values**, not concentrated on just a few. That means most of these aren't actually FFFF being miscoded — they're real values that happen to have many F nibbles (like sign-extended negative numbers, indexing instructions with F-bit immediates, etc.).
+
+But here's an important signal: **3,262 exact `0xFFFF`s** decoded correctly. That's a LOT of correctly-decoded FFFFs. So the FFFF anchor is working.
+
+Let me look at this differently — your idea about vectors having low-byte addresses is the better path:**Vector 78's target is `0x01FF`** — and looking at byte offset 0x0144 in the decoded file, the bytes are `54 e2 ff 01` which little-endian-decodes to JSR `0x01FF`. That doesn't fit the pattern.
+
+Now here's the key analytical question: **is `0x01FF` actually correct, or is it a heuristic miscoding?**Now this is interesting:
+
+- Vectors 70-77, 79-81 all have target `0x7015` 
+- **Vector 78 alone** has target `0x01FF`
+
+This is structurally suspicious. The pattern strongly suggests vector 78 should also be `0x7015` (default handler), and the `0x01FF` is a heuristic miscoding. But it could *also* be a genuine specific handler that happens to be in low memory.
+
+There's a way to test this with the decoder directly:Now let me also pursue the better path — using **already-pinned values across the file** to find inconsistencies that pinpoint wrong nibbles:## Summary of where we stand and the path forward
+
+**The current decode is largely correct but heuristic-fuzzy.** We have 9 pair-ids pinned (out of 64) — FFFF + JMP + JSR contribute 4 + 4 + 1 = 9 pins. The remaining 55 pair-ids use the frequency heuristic, which gets *most* values right (because DSP56800E firmware is highly biased toward F nibbles in opcodes), but is wrong for some specific values.
+
+### Evidence the decode is mostly right
+- 82 vectors decoded
+- 74 of them target the same address (0x7015) — exactly the "default handler" pattern
+- Reset vectors point to a sensible startup address (0xDF5F)
+- 5 specific handlers at plausible addresses (0x7075, 0x7085, 0x70D5, 0x98AF, 0xB015)
+- 3,262 exact `0xFFFF` codewords (erased flash regions throughout)
+
+### Evidence of heuristic errors
+- Vector 78 alone has target `0x01FF` (very suspicious — should probably be `0x7015`)
+- 1,667 "almost FFFF" words (3 of 4 nibbles = F) — likely some are real FFFFs being miscoded
+
+### Best path forward: add 0x7015 as an anchor
+
+That single anchor pins 4 new pair-ids and provides massive leverage because the 74 default-handler entries are scattered throughout the vector table, validating the mapping across many byte positions.
+
+**Try this:**
+
+```bash
+# Find the new FFFF anchor index (it shifted with the frame structure fix)
+python3 dsp56800e_decoder.py firmware.elf.e --skip 13 --find-runs 5
+
+# Build new anchors. Use the longest FFFF run's start index, and add 0x7015.
+# The default-handler target codeword is at index 17 (= 6 + 5*2 + 1, for vector 5).
+echo '[[<FFFF_INDEX>, "0xFFFF"], [6, "0xE154"], [10, "0xE254"], [17, "0x7015"]]' > anchors.json
+
+# Check consistency
+python3 dsp56800e_decoder.py firmware.elf.e --skip 13 \
+    --anchors anchors.json --nibble-order 0231 --check-anchors
+```
+
+**Expected outcome:**
+- "Consistent: True" with 13 pinned (3+3+3+4 across positions). This means our decode of `0x7015` was correct, and we now have 4 more nibbles locked.
+- After re-decoding, the `0x01FF` at vector 78 should change. If it changes to `0x7015`, the heuristic was just guessing wrong there. If it changes to something else, vector 78 might really have a special target.
+
+Then do a full decode and look at the bytes after the vector table (offset 0x154 onward). With more nibbles pinned, the actual handler code at `_startup` (0xDF5F) should be locatable somewhere in the file — and the `_startup` routine begins with a recognizable prologue that we can use as more anchors.
+
+About the FFFFs near the end: those are likely the **erased flash trailer**. Every CodeWarrior-built firmware has FFFF padding at the end of program flash up to the configuration field. The fact that some bytes aren't quite FFFF tells us the heuristic is decoding those positions wrong — adding more anchors will progressively fix them.
+

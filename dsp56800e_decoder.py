@@ -80,11 +80,14 @@ STD_PAYLOAD_SIZE = STD_FRAME_SIZE - FRAMING  # 152 bytes = 38 codewords
 # The FFFF marker bytes (constant for all frames)
 FFFF_MARKER = b"\x9c\x66\x1b\xa5"
 
-# All sync values observed in the analysed file.
+# Sync values observed across the analysed firmware files.  This set is
+# kept for informational purposes only — frame detection now uses the
+# constant FFFF_MARKER at +4 from the sync, which matches every variant.
 VALID_SYNCS = {
-    b"\x99\x56\x87\x68",  # standard
+    b"\x99\x56\x87\x68",  # standard / interior
     b"\x99\x55\x83\x68",  # boundary variant — observed at file start
     b"\x99\x56\x83\x68",  # boundary variant — observed at file end
+    b"\x99\x56\x83\x1D",  # mid-file variant — observed in custom firmware
 }
 
 # Bytes 2 and 3 of the tag word are fixed markers (with disparity flip).
@@ -155,13 +158,16 @@ def find_frames(data: bytes,
                 start_offset: int = 0,
                 end_offset: int | None = None,
                 ) -> list[dict]:
-    """Locate every frame in `data` by sync-byte detection.
+    """Locate every frame in `data` by scanning for the FFFF-marker.
 
-    Frame structure: [sync 4 bytes][payload N-8 bytes][tag 4 bytes].
-    The tag's bytes 2,3 carry the marker (0x26,0x9F) or (0xBF,0x53),
-    but tag detection is *not* used for sync validation since the tag
-    sits at the end of the frame, not next to the sync.  Sync is
-    detected by exact byte-sequence match alone.
+    Frame structure: [sync 4][FFFF-marker 4][metadata 4][payload N-16][tag 4].
+
+    The frame's sync (bytes 0..3) varies — observed values include
+    99 55 83 68, 99 56 87 68, 99 56 83 68, and 99 56 83 1D — and likely
+    encode some frame-type flag.  The FFFF-marker, however, is the
+    constant 4-byte sequence 9c 66 1b a5 at offset +4 from every sync.
+    Detecting frames via the marker is far more robust than enumerating
+    every legal sync variant.
 
     Args:
         data: full file bytes.
@@ -173,31 +179,32 @@ def find_frames(data: bytes,
         Frames in file order.  Each frame's `frame_size` is the
         distance to the next sync (or to `end_offset` for the final
         frame).  Each frame includes pre-computed `payload_start`,
-        `payload_size`, and `tag` (the 4 bytes preceding the next
-        frame's start, or the file end for the last frame).
+        `payload_size`, `ffff_marker`, `metadata`, and `tag`.
     """
     if end_offset is None:
         end_offset = len(data)
-    last_search = end_offset - SYNC_LEN + 1
 
+    # A frame begins at byte B where:
+    #   data[B] == 0x99
+    #   data[B+4 : B+8] == FFFF_MARKER (= 9c 66 1b a5)
+    # The 0x99 prefix on the sync gives us a quick reject; the FFFF marker
+    # confirms.  This catches every sync variant without enumerating them.
     sync_positions: list[int] = []
     pos = start_offset
+    last_search = end_offset - SYNC_LEN - FFFF_MARKER_LEN + 1
     while pos < last_search:
-        if bytes(data[pos:pos + SYNC_LEN]) in VALID_SYNCS:
+        if (data[pos] == 0x99 and
+                bytes(data[pos + SYNC_LEN
+                            :pos + SYNC_LEN + FFFF_MARKER_LEN]) == FFFF_MARKER):
             sync_positions.append(pos)
-            # Skip past the sync; a sync inside its own bytes is not
-            # possible, and skipping avoids matching inside payloads
-            # by chance in the rare case where a payload codeword
-            # happens to equal one of the sync values.
-            pos += SYNC_LEN
+            pos += SYNC_LEN + FFFF_MARKER_LEN
             continue
         pos += 1
 
     if not sync_positions:
         raise ValueError(
-            "no valid sync words found in file; is this the right "
-            "format? (expected sync ∈ "
-            "{99 56 87 68, 99 55 83 68, 99 56 83 68})")
+            "no frames found; expected the constant FFFF marker "
+            "9c 66 1b a5 at offset +4 from each sync, with sync byte 0 = 0x99")
 
     frames = []
     for i, start in enumerate(sync_positions):
