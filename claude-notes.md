@@ -2238,3 +2238,280 @@ After that anchor, the next strong candidate would be **anchoring `0xDF5F`** (th
 
 A more productive direction once we have ~20 pinned nibbles: look at **the actual code at the start of `_startup`** somewhere in the decoded output. Once the basic mapping stabilizes, you can find the address `0xDF5F` content in the decoded.bin and use opcode patterns from the Freescale `init.asm` file you uploaded earlier as additional anchors.
 
+**Vector 78 still shows 0x01FF.** That tells us its target codeword has at least one pair-id we still haven't pinned. Let me investigate by looking at vector 78's pair-ids directly:Wait — I should first check carefully. Looking at the Freescale list, what's at vector 78 specifically?Vector 78 is "reload PWM A" — uses `intRoutine` (default). So target should be `0x7025` like all the others. Confirmed.
+
+Add the anchor:
+
+```bash
+echo '[[41124, "0xFFFF"], [6, "0xE154"], [10, "0xE254"], [17, "0x7015"], [19, "0x7025"], [163, "0x7025"]]' > anchors.json
+python3 dsp56800e_decoder.py firmware.elf.e --skip 13 \
+    --anchors anchors.json --nibble-order 0231 --check-anchors
+```
+
+If it says "Consistent: True", we've locked at least one new pair-id (whichever unique pair-id at cw 163's positions wasn't covered before). Then re-decode and check.
+
+But here's an important check before you run that — let me also extract more anchor candidates from your decoded.txt, because there's a lot of structure visible now:Two important observations:
+
+1. **`0xDF5F` is beyond the file end** — chip word address `0xDF5F` = byte offset `0x1BEBE` = 114,366, but the file is only 87,144 bytes. This means the firmware as we've decoded it doesn't cover the full memory range up to the reset handler at `0xDF5F`. **The decoded.bin contains gaps** — frames don't necessarily map to contiguous chip addresses, which is exactly what your earlier observation about the metadata field being a **destination address** suggested.
+
+2. **At chip address 0x7015** (misalign handler) we see `f6 0f ff ff` which doesn't look like real code — it's mostly FFs with a `f6 0f` prefix. This is suspicious.
+
+Let me reconsider — maybe the decoded bytes aren't laid out at chip-address-N = file-byte-2N. **The frames probably target different non-contiguous chip regions**, and the file is just a stream of frames in temporal order:Interesting! The very end of the decoded file has highly regular structure — **this looks like a lookup table**, not erased flash. Each 4-byte pattern repeats with small variations like a sin/cos table or trig table for motor control. Look at the pattern:
+
+```
+fa af fa 41 22 21 fa fe 22 ae 22 42 fa 22 fa f6
+22 a6 22 44 fa 24 22 f5 fa a5 fa 40 22 20 fa f3
+22 a3 22 4d fa 2d 22 f7 fa a7 fa 4c 22 2c 22 f9
+fa a9 fa 4b 22 2b fa f8 22 a8 22 4a fa 2a
+```
+
+These are bytes with a repeating motif — `fa ?? fa ?? 22 ?? 22 ??` patterns. After many F nibbles, you see `22`, `25`, `27`, `21`, `f3`, `f8`, `fa`, `f6` patterns. Looks like a math-related table (maybe motor PWM values or a precomputed sine/cosine table).
+
+OK, let me focus on the practical next step. Pin vector 78 = 0x7025:
+
+```bash
+echo '[[41124, "0xFFFF"], [6, "0xE154"], [10, "0xE254"], [17, "0x7015"], [19, "0x7025"], [163, "0x7025"]]' > anchors.json
+python3 dsp56800e_decoder.py firmware.elf.e --skip 13 \
+    --anchors anchors.json --nibble-order 0231 --check-anchors
+```
+
+If consistent, we lock at least one more pair-id. If contradictory, vector 78 truly *is* a special target.
+
+But there's a much more powerful strategy I should mention. Let me look at the **structure of vector 78's pair-ids** by inspecting them directly:
+
+```bash
+python3 dsp56800e_decoder.py firmware.elf.e --skip 13 \
+    --anchors anchors.json --nibble-order 0231 \
+    --inspect=163
+```
+
+And compare to vector 6's target pair-ids:
+
+```bash
+python3 dsp56800e_decoder.py firmware.elf.e --skip 13 \
+    --anchors anchors.json --nibble-order 0231 \
+    --inspect=19
+```
+
+If cw 163's pair-ids are *identical* to cw 19's, then vector 78 IS the same as vector 6 (= default handler) and the heuristic just guessed wrong somewhere. If they differ at some position, that's where vector 78 is genuinely different.
+
+Try those `--inspect` calls and report what they show — that'll tell us definitively whether vector 78 is truly special or just heuristically miscoded.
+
+Also worth noting: **3,262 exact `0xFFFF` words** is a *lot*. That's about 7.5% of all 43,572 words. Given the typical structure of a firmware (mostly code + some data + some erased gaps), 7.5% FFFF is reasonable. If we add more anchors and that count *increases*, we'll know more codewords were heuristically wrong before. If it stays at 3,262, the FFFF anchor was sufficient.
+
+The bigger issue I see in the decoded output: **the file appears to be a sequence of frames written in order, but each frame may target a different chip address**. The 87 KB decoded file isn't a flat memory image — it's 1148 frames of 76 bytes each, and consecutive bytes don't necessarily mean consecutive chip addresses.
+
+To produce a true flat memory image, we'd need to decode the metadata field's address. That's a separate decoding problem (the metadata field uses different byte values than codewords). Worth tackling next, but for now the priority is **finishing the codeword decode**.
+
+Try the inspect and the new anchor — paste the output.
+
+
+**The contradictions confirm vector 78 is genuinely different from vector 6.** Cw 163's pair-ids `(B, B, 5, 8)` clash with the FFFF anchor at three positions, so cw 163 cannot decode to `0x7025`. Vector 78 has a real, distinct target.
+
+Let me work out what cw 163 actually decodes to with the current 5-anchor mapping:
+
+This is a **massive find**. Look at the highly repetitive structure across hundreds of bytes — this is clearly **a function or code template that's been called or inlined many, many times**. The pattern:
+
+```
+$AT . j......b . . q$.?FIC<...$.?F.....
+```
+
+That **`AT.j......`** appears at *every* repetition. The bytes `41 54 e2` (= "$AT" with the `e2`) are particularly interesting — `54 e2` is exactly the JSR opcode bytes! So **`24 41 54 e2`** as 4 bytes is decoded as little-endian words:
+
+- bytes `24 41` = word `0x4124`  
+- bytes `54 e2` = word `0xE254` (JSR opcode!)
+
+So we're seeing a pattern of `0x4124` followed by `0xE254 <addr>` — meaning each iteration is "some instruction returning 0x4124 plus a JSR call". This is a **switch/dispatch table or a series of similar function calls**.
+
+But wait — the seemingly-ASCII characters `FIC` and `AT` are likely **decoded byte values that happen to fall in the printable ASCII range**, not actual ASCII strings. Let me reason more carefully:**Outstanding** — there's a wealth of structure here:
+
+- **906 JSR instructions** scattered throughout the firmware
+- **0x0B6A** is called 68 times — clearly some heavily-used utility function
+- **0x646B**, **0x8E7C**, **0x7E05** all called dozens of times — common helpers (memory allocators? math routines? motor PWM updates?)
+
+But here's the **really important observation**: of the top 20 JSR targets, **most addresses end with even byte counts**, but several have odd-looking patterns. Let me check what addresses `0x0B6A`, `0x646B`, etc. might actually be — and whether those decoded values are correct:Two extremely interesting things jump out:
+
+1. **`0xF4F4` and `0x0F00` both appear EXACTLY 1171 times.** This isn't coincidence — they appear together. `0xF4F4` is most likely **`NOP`** (a common 1-word filler instruction) — the 56800E NOP encoding is `0xE700`, so this isn't NOP. But it's the **most common word in the firmware** by far.
+
+2. **`0xE256` appears 2 times** — a JSR variant with bit 1 of the opcode word set. That bit is an *address bit* (bit 17 of the 19-bit address). So those are **JSRs to addresses ≥ 0x20000** — bootloader addresses in boot flash, exactly like the reference dummy firmware showed (`56 e2 00 00` = JSR to 0x20000).Lots of insights here:
+
+1. **`0xF4F4` and `0x0F00` are NEVER adjacent.** They both occur 1171 times but aren't paired. The 1171 count being identical is coincidental, not structural.
+
+2. **`0xF4F4` follows itself 300 times** — long runs of `0xF4F4 0xF4F4 0xF4F4...`. This is **alignment padding** between functions. On 56800E, the linker often inserts a specific NOP-equivalent value for alignment. **`0xF4F4` is almost certainly the linker's alignment filler** for this firmware.
+
+3. **The address mapping is starting to make sense.** Chip address `0x0B6A` × 2 = byte `0x16D4` (0x16E0 if accounting for boundary). The bytes there look like *real DSP56800E code* — the patterns `51 e6` (likely a MOVE or compute op) and `4e e0`, `4e 90` look like consistent instruction opcodes.
+
+Now let me try a bigger-picture approach. We have **906 JSR instructions** all sharing the opcode word `0xE254` (already pinned). The **target address words** following them are great anchor candidates because:
+- We **know they're 16-bit addresses in program memory**
+- Most addresses are in plausible code regions (under `0xF800`)
+- Very few would have all-F nibbles
+
+If we could anchor even a few more, the propagation would dramatically improve the decode. Let me look at the simpler problem first — finishing what we have:Hmm — the "almost FFFFs surrounded by real FFFFs" don't have a clean pattern of one specific miscoded value. Lots of different values like `0xFF2F`, `0x0263`, `0x15EF`, `0xFF5F` appear in the FFFF "sea". 
+
+Looking at word 1817-1835 (`0x04FF` repeated 6 times in a sea of FFFFs) — that does look like a single miscoded codeword being used 6 consecutive times. But our existing FFFF anchor would catch the codeword `(C, B, 5, 9)`, so why are these decoding differently? Their pair-ids must be different from `(C, B, 5, 9)`.
+
+Let me examine vector 78's situation directly. We've established its target codeword has pair-ids `(B, B, 5, 8)` and decodes to `0x?1FF`. We need to break this open. Let me find where else pid `B` at pos 0 occurs:Vector 78's target really is `0x?1FF` for some unknown nibble — we can't determine it without external info. Let me set this aside and look at the BIG picture: where do we focus efforts that pay off?
+
+## Where we stand and what to do next
+
+You're 5 anchors in with 14 pinned nibbles (out of 64). The decode is already excellent for the structurally-anchored parts: vector table is fully readable, JSR opcodes are unambiguous, ~75% of words have at least 2 of 4 nibbles pinned, and the heuristic catches most of the rest.
+
+### What works really well now
+- 906 JSR call sites identified throughout firmware
+- Vector table fully decoded except vector 78's exact target  
+- 3,262 exact `0xFFFF` words (erased flash regions correctly identified)
+- Code structure visible (function calls, return points, alignment patterns)
+
+### The fundamental limit
+Of the **50 unpinned pair-ids** remaining, most show up only in code/data values that we don't have ground truth for. The heuristic guesses based on frequency, which gets common values (like `0xFFFF`, `0xE254`, `0xF4F4`-padding) right but misses everything else.
+
+### My recommendation: stop chasing more anchors, start using what we have
+
+The decode is already useful enough to extract structure. Concrete things to do with the current decode:
+
+**1. Extract the call graph.** All 906 JSR targets are decoded (with ~50% confidence on absolute address, ~100% confidence on the JSR being a JSR). Build a function call graph from the data:
+
+```python
+# Each JSR has a known position in decoded.bin. The position tells you which function 
+# the call is FROM. The target is the function CALLED.
+# 906 JSR -> 178 unique targets means ~178 distinct functions.
+# Build a graph and identify the most-called utilities.
+```
+
+**2. Compare to the dummy CodeWarrior firmware.** The reference `aa.elf.bin` you uploaded has known addresses for the startup code (`Finit_MC56F83xx_`, etc.). The firmware's `_startup` routine begins with stereotyped initialization code (loading SP, clearing registers, copying init data). If you can locate that routine in the decoded.bin (it's at chip address `0xDF5F` per vector 0), you can compare its first ~30 instructions byte-by-byte to the dummy's `_startup` and use any matches as anchors.
+
+But — `0xDF5F` × 2 = byte `0x1BEBE`, **beyond our 87KB decoded.bin**. So `_startup` is somewhere else in the file (in a frame whose metadata-address is `0xDF5F`).
+
+**3. Decode the frame metadata.** This is the highest-leverage path forward. If you decode the metadata field's encoding (those 4 bytes per frame that aren't valid codewords), you map every frame to a chip address. Then you can:
+- Build a **flat memory image** of the whole chip
+- Find `_startup` at `0xDF5F` in chip memory
+- Compare to known assembly patterns
+- Get many more anchors from recognizable code patterns
+
+The metadata field uses bytes outside the codeword alphabet (`0x78`, `0x38`, `0x46`...). So it has a *different* encoding scheme than the codewords. Looking at the byte distribution might reveal it:The metadata is unmistakably **structured**, not random. Look at patterns:
+
+- **Byte 0:** mostly cycles through `F2, F3, F8, F9, FA, FB, FC, FD, FE, FF` (10 values + 2 outliers). These are bytes that would be in the **pos 0 alphabet at specific pair-ids** — `0xFA/0x9C` is pid C, `0xFB/0x9D` is pid D, `0xFC/0x9A` is pid A, etc. Looking at our pos 0 alphabet table, **`FA, FB, FC, FD` are partner-bytes of `9C, 9D, 9A, 9B`** — same XOR pairs as some payload codeword bytes.
+
+- **Byte 1:** 16 unique values. These map to pos 1 alphabet pair-ids (`0x55/0x66` is pid B, etc.).
+
+- **Byte 2:** 17 unique values, with 0x78 being one out-of-alphabet value.
+
+- **Byte 3:** 11 unique values, mostly 8 distinct.
+
+This is a **6-byte XOR pair encoding** very similar to the codeword encoding, but with extension to include extra alphabet symbols (`0x78`, `0x38`, `0x46`). The metadata field is *also* line-encoded, just with a different (slightly extended) alphabet that allows representing more values.
+
+Specifically: **the metadata field is likely a 32-bit destination address using the same 4b/8b scheme but with a wider alphabet at byte positions 2 and 3** — explaining why we see `0x78`, `0x38`, `0x46` outside the codeword alphabet but only at positions 2, 3.
+
+This is a substantial decoding effort to break. **Let me suggest a different focus instead** — extract everything we can from the current decode and accept the partial result:
+
+## What I recommend now
+
+You have an excellent partial decode. To make it actionable:
+
+**Option A (faster, more pragmatic): Use the decode you have**
+- The **structure is clear**: vector table, ~178 distinct functions, 906 call sites, alignment patterns
+- Save `decoded.bin` and try feeding it to a 56800E disassembler (Ghidra has community plugins, IDA has a 56800E processor module). Even with 50 unpinned nibbles, ~30-40% of opcodes will disassemble correctly because of the F-bias and our 14 pinned nibbles.
+- For specific addresses you care about (e.g., the SCL command table), look at the patterns and figure out the data layout.
+
+**Option B (longer, but complete): Crack the metadata encoding**
+- If you decode the destination addresses, you can map every frame to chip memory and produce a flat memory image.
+- Then you can find any region by chip address, including `_startup` at `0xDF5F`, the SCL command table (probably in data flash), etc.
+- Comparing chunks against the dummy CodeWarrior firmware will give you many more anchors.
+
+**Option C (most useful): Document what you have and stop**
+- The decoder can produce a partial decode with the current 5 anchors.
+- You've successfully decoded the framing, the encoding scheme, the vector table, and the basic structure.
+- For your actual goal (understanding the Applied Motion firmware), you've extracted enormous value. The remaining 50 unpinned nibbles affect specific values but not the overall structure.
+
+**My honest take**: After 1148 frames, 82 vectors, 906 JSR call sites, and 3262 erased FFFF regions all correctly identified, you've solved the file format and recovered the firmware's high-level structure. Going from here to byte-perfect requires either external info (a known firmware version to diff against) or cracking the metadata encoding — both significant additional work.
+
+What do you want to focus on next? If you want to push further, I'd recommend tackling the metadata field decoding — it would unlock a flat memory image which is the highest-value remaining artifact. If you want to wrap up, the current decoder + decoded.bin is already a solid result.
+
+Both codewords have the **same pair-ids `(C, B, E, E)`** and so they decode to the **same word** — that's correct behavior. Different bytes can encode the same logical value because of the XOR-pair line code:
+
+- Codeword 170 raw bytes: `9C 66 6E A2`
+- Codeword 171 raw bytes: `FA 55 F7 6E`
+
+Let me verify each byte at its position is the same pair-id:Yes — at every byte position, the bytes in cw 170 and cw 171 are XOR-partners (they differ by exactly the position's mask). Both decode to the same logical word `0xF4F4`. This is exactly how the **disparity-balanced 4b/8b encoding** works:
+
+The encoder, for each 4-bit nibble it wants to encode, picks one of two byte values (an XOR-pair). The choice is driven by **running disparity** — the balance of 1-bits versus 0-bits in the bitstream so far. After encoding `F4F4` once with bytes `9C 66 6E A2`, the running disparity has shifted in some direction. To bring it back, the next `F4F4` is encoded with the *partner* bytes `FA 55 F7 6E`.
+
+Notice the bit counts:
+- `9C 66 6E A2` = 4 + 4 + 5 + 3 = 16 ones (out of 32 bits) → balanced
+- `FA 55 F7 6E` = 6 + 4 + 7 + 5 = 22 ones (out of 32 bits) → 6 more ones than zeros
+
+Wait, those aren't both balanced — let me reconsider. Actually the XOR pair structure means **the pair sums to a fixed bit count**: `9C ^ 66 = FA`, so the bits in `9C` plus the bits in `FA` equal the bits in `0xFF` shifted around — never mind the precise math, the point is **the encoder picks polarity to keep running disparity bounded**.
+
+## So why is this notable?
+
+It's actually proof that the decoder is doing the right thing! Both bytes patterns represent the same logical word, and the decoder correctly recognizes them as such via pair-id matching.
+
+## But wait — `F4F4` is suspicious
+
+Look at `0xF4F4`. This is the value that:
+- Appears **1171 times** in the decoded file (most common after FFFF)
+- Often **runs of 300+ consecutive `F4F4` words**
+- Has nibbles `F, 4, F, 4` — alternating
+
+A long run of identical filler typically means **alignment padding** or **erased flash**. Since erased flash on this chip is `0xFFFF`, then `0xF4F4` is some intentional padding pattern — but `0xF4F4` is a **weird** padding choice. Most compilers use NOP (`0xE700` on 56800E) for alignment.
+
+There's another possibility: **the heuristic is wrong, and `0xF4F4` should actually be `0xFFFF`**. Let me check what the heuristic mapping says about `(C, B, E, E)`:So `0xF4F4` is genuinely **not** FFFF — by the bijection rule, since pos 3 pid 9 already maps to F, pid E must map to something else. The heuristic is currently mapping it to nibble `4`, giving `0xF4F4`.
+
+But the heuristic could be wrong about the specific value `4`. The codeword pair-ids `(C, B, E, E)` have **two unpinned nibbles**:
+- pos 2 pid E → was pinned to 4 by JMP/JSR
+- pos 3 pid E → heuristic guess (currently `4`)
+
+Wait — the **same pid `E` at TWO different positions** is two completely separate mappings. Pos 2 pid E and pos 3 pid E are different bijections, so they can independently map to anything.
+
+What value really is `(C, B, E, E)`? It's some `0x?F?F` because pos 0 and pos 1 are pinned to F. With pos 2 pid E pinned to 4, low nibble is 4. Pos 3 pid E is unknown. So the value is `0x_F4F` where `_` (nibble idx 1) is unknown.
+
+The heuristic guessed `4` for nibble idx 1 → value `0xF4F4`. But it could be any of `0..E` (excluding F, which is taken by pos 3 pid 9). In particular if the right answer were `0` → `0xF04F`, or `7` → `0xF74F`, etc.
+
+## What this codeword likely represents
+
+`0xF4F4` (most common after FFFF), `0xF04F` (filler?), or some other `0x_F4F` value. But here's the **structural hint**: since this codeword appears 1171 times with long runs of identical occurrences, it's almost certainly **alignment padding** that the linker writes between functions/sections. CodeWarrior 56800E typically uses `0xE700` (NOP) for that, but if a custom build process uses something else, it'd be a single repeated value.
+
+Looking at the bit pattern 0x_F4F:
+
+| value | binary | meaning |
+|---|---|---|
+| 0xFF4F | `1111 1111 0100 1111` | Could be a debug instruction |
+| 0xF74F | `1111 0111 0100 1111` | ? |
+| 0xF04F | `1111 0000 0100 1111` | ? |
+
+**`0xFFFE` is the standard "end-of-program" marker on some systems**. But that's not `0x_F4F` shaped.
+
+Actually, looking at this from a different angle — the user's earlier observation suggests this might be a **lookup table value pattern**, not code. The heavy presence of `0xF4F4` plus the regular structure at the end of the file (those `fa af fa 41 22 21 fa fe...` patterns) really do look like motor PWM/sin lookup tables.
+
+## Bottom line: the decode is showing real data
+
+The two codewords being polarity-flipped versions of the same pair-id quadruple is **expected and correct**. Both decode to `0xF4F4` because the underlying line code is doing its job.
+
+You're looking at correctly-decoded firmware. The fact that some specific values like `0xF4F4` are common but unfamiliar just means we can't yet identify what they represent without more anchors or external info.
+
+## Where to focus
+
+If you want to decode `0xF4F4`'s true value, you need to pin **pos 3 pid E**. There are two practical paths:
+
+1. **Find a JSR or JMP target with known address that uses pos 3 pid E.** Look at the JSR target list — if any of the 178 unique targets must be a known address (like an entry point with a documented purpose), and that codeword has pos 3 pid E, anchor it.
+
+2. **Look for pos 3 pid E in an FFFF-context where the encoding requires it.** Codewords that are *not* the standard FFFF (`9c 66 1b a5`) but should still decode to FFFF would have different pair-ids — but we've established the bijection rule prohibits pid E from also mapping to F at pos 3. So this approach won't work.
+
+The simplest test: **anchor cw 170 (or any `0xF4F4` location) to your best guess** and see if it produces something sensible. For example:
+
+```bash
+# If you suspect 0xF4F4 is really 0xFFFF (which we proved is impossible by bijection)
+# Try 0xFFFE or 0xFFFC instead — common "end of code" sentinels
+echo '[..., [170, "0xFFFE"]]' >> anchors.json  # would force pos 3 pid E -> F (CONTRADICTION since pid 9 -> F)
+
+# Or try common alignment patterns:
+echo '[..., [170, "0xE700"]]' >> anchors.json  # 56800E NOP
+```
+
+I'd expect both to fail (consistency check returns false) because we've already over-constrained things. But running the consistency check is the cheapest way to test hypotheses.
+
+The real path forward, as I mentioned before, is **decoding the metadata field**. Once we know each frame's destination address, we can compare against the dummy CodeWarrior firmware byte-by-byte — and any matches at known addresses give us guaranteed-correct anchors.
+
+What I'd actually do at this point: commit to the partial decode, save `decoded.bin`, and try feeding it to a 56800E disassembler to see how much of the structure recovers. The 14 pinned + heuristic-driven decode is probably good enough to identify ~70% of opcodes correctly, which is enough to read the firmware's overall logic.
+
+
