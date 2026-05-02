@@ -523,6 +523,50 @@ def inspect_codewords(pair_rows: Sequence[tuple[int, int, int, int]],
     return out
 
 
+def parse_int_ranges(spec: str,
+                     *,
+                     min_value: int | None = None,
+                     max_value: int | None = None,
+                     ) -> list[int]:
+    """Parse comma-separated integers and inclusive ranges.
+
+    Examples:
+        "2,5,8-10" -> [2, 5, 8, 9, 10]
+        "0x10-0x12" -> [16, 17, 18]
+    """
+    values = []
+    seen = set()
+    for raw_token in spec.split(","):
+        token = raw_token.strip()
+        if not token:
+            continue
+
+        if "-" in token[1:]:
+            sep = token.find("-", 1)
+            lo = int(token[:sep], 0)
+            hi = int(token[sep + 1:], 0)
+            if hi < lo:
+                raise ValueError(f"invalid descending range {token!r}")
+            candidates = range(lo, hi + 1)
+        else:
+            candidates = [int(token, 0)]
+
+        for value in candidates:
+            if min_value is not None and value < min_value:
+                raise ValueError(
+                    f"value {value} below minimum {min_value}")
+            if max_value is not None and value > max_value:
+                raise ValueError(
+                    f"value {value} above maximum {max_value}")
+            if value not in seen:
+                seen.add(value)
+                values.append(value)
+
+    if not values:
+        raise ValueError("range spec did not contain any values")
+    return values
+
+
 def find_candidate_words(pair_rows: Sequence[tuple[int, int, int, int]],
                          target: int,
                          existing_anchors: Iterable[tuple[int, int]] = (),
@@ -874,6 +918,10 @@ def main(argv=None) -> int:
                          "0xFFFF and reports candidates by structural score.")
     ap.add_argument("--search-range", metavar="LO:HI", default="0:0x10000",
                     help="value range for --search-anchor (default 0:0x10000)")
+    ap.add_argument("--search-vectors", metavar="SPEC", default="0-81",
+                    help="vector numbers to validate during --search-anchor. "
+                         "SPEC is comma-separated integers/ranges, e.g. "
+                         "'2-19,22-77,79-81'. Default: all vectors 0-81.")
     ap.add_argument("--vector-table-end", metavar="ADDR",
                     type=lambda s: int(s, 0), default=0xA4,
                     help="chip address where the vector table ends (default "
@@ -1037,7 +1085,13 @@ def main(argv=None) -> int:
         # Vector table layout: starts at codeword 6 (after 6-codeword boundary).
         # Each vector = 2 codewords (opcode + target). 82 vectors total.
         # Vector N target codeword = 6 + N*2 + 1.
-        vec_target_cws = [6 + n * 2 + 1 for n in range(82)]
+        try:
+            search_vectors = parse_int_ranges(
+                args.search_vectors, min_value=0, max_value=81)
+        except ValueError as e:
+            print(f"--search-vectors: {e}", file=sys.stderr)
+            return 2
+        vec_target_cws = [(n, 6 + n * 2 + 1) for n in search_vectors]
 
         # JSR <ABS19> opcode template = 0xE254. Targets that come after JSR (vec 2-81)
         # are 16-bit addresses for in-program-flash targets. JMP targets (vec 0,1)
@@ -1055,6 +1109,8 @@ def main(argv=None) -> int:
         print(f"  Considering values 0x{val_lo:04X} .. 0x{val_hi:04X}",
               file=sys.stderr)
         print(f"  Vector table end address: 0x{vt_end:04X}", file=sys.stderr)
+        print(f"  Search vectors: {args.search_vectors} "
+              f"({len(search_vectors)} selected)", file=sys.stderr)
         print(f"  Valid target: addr >= 0x{vt_end:04X} OR addr >= 0x8000",
               file=sys.stderr)
         print(f"  Base anchors: {len(anchors)}", file=sys.stderr)
@@ -1069,9 +1125,9 @@ def main(argv=None) -> int:
             except ValueError:
                 return None  # contradiction
 
-            # Decode all 82 vector targets
+            # Decode selected vector targets.
             targets = []
-            for vt_cw in vec_target_cws:
+            for vec_num, vt_cw in vec_target_cws:
                 if vt_cw >= len(pair_rows):
                     return None
                 pids = pair_rows[vt_cw]
@@ -1080,10 +1136,10 @@ def main(argv=None) -> int:
                 for p in range(4):
                     nib = mappings[p][pids[p]]
                     v |= nib << (12 - 4 * nibble_order[p])
-                targets.append(v)
+                targets.append((vec_num, v))
 
             # Score: number of valid targets
-            n_valid = sum(1 for t in targets if is_valid_target(t))
+            n_valid = sum(1 for _, t in targets if is_valid_target(t))
             return {
                 "value": value,
                 "targets": targets,
@@ -1106,38 +1162,48 @@ def main(argv=None) -> int:
         print(f"  Tested {n_tested} values, {n_consistent} mathematically consistent",
               file=sys.stderr)
 
-        # Filter: only show results where ALL 82 targets are valid
+        # Filter: only show results where ALL selected targets are valid
         perfect = [r for r in results if r["n_valid"] == r["n_total"]]
         # Sort by valid count descending
         results.sort(key=lambda r: -r["n_valid"])
 
+        def print_vector_targets(targets: Sequence[tuple[int, int]]) -> None:
+            items = [f"vec {vec_num}=0x{addr:04X}"
+                     for vec_num, addr in targets]
+            for i in range(0, len(items), 8):
+                print(f"      {'  '.join(items[i:i + 8])}",
+                      file=sys.stderr)
+
         if perfect:
-            print(f"\n  *** {len(perfect)} value(s) give ALL 82 vectors valid! ***",
+            print(f"\n  *** {len(perfect)} value(s) give ALL "
+                  f"{len(search_vectors)} selected vectors valid! ***",
                   file=sys.stderr)
             from collections import Counter
             for r in perfect[:30]:
-                tc = Counter(r["targets"])
+                tc = Counter(t for _, t in r["targets"])
                 default, n_default = tc.most_common(1)[0]
                 specifics = sorted(t for t, n in tc.items() if n < n_default)
                 spec_str = ", ".join(f"0x{t:04X}" for t in specifics)
                 print(f"    cw {cw_idx} = 0x{r['value']:04X}: "
                       f"default=0x{default:04X} ({n_default}×), "
                       f"specifics=[{spec_str}]", file=sys.stderr)
+                print_vector_targets(r["targets"])
         else:
-            print(f"\n  No value gives all 82 vectors valid. "
-                  f"Top 10 by score:", file=sys.stderr)
+            print(f"\n  No value gives all {len(search_vectors)} selected "
+                  f"vectors valid. Top 10 by score:", file=sys.stderr)
             from collections import Counter
             for r in results[:10]:
-                tc = Counter(r["targets"])
+                tc = Counter(t for _, t in r["targets"])
                 default, n_default = tc.most_common(1)[0]
                 # Find which targets are INVALID (inside vector table)
-                invalid = sorted({t for t in r["targets"]
+                invalid = sorted({t for _, t in r["targets"]
                                   if not (t >= vt_end or t >= 0x8000)})
                 inv_str = ", ".join(f"0x{t:04X}" for t in invalid)
                 print(f"    cw {cw_idx} = 0x{r['value']:04X}: "
                       f"{r['n_valid']}/{r['n_total']} valid, "
                       f"default=0x{default:04X}, invalid=[{inv_str}]",
                       file=sys.stderr)
+                print_vector_targets(r["targets"])
             print(file=sys.stderr)
             print(f"  Try a different cw_idx, expand --search-range, or "
                   f"check if base anchors are correct.", file=sys.stderr)
