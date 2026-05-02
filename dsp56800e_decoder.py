@@ -864,6 +864,21 @@ def main(argv=None) -> int:
     ap.add_argument("--check-anchors", action="store_true",
                     help="validate the anchors in --anchors for mutual "
                          "consistency and report nibble coverage")
+    ap.add_argument("--search-anchor", metavar="CW_IDX",
+                    type=lambda s: int(s, 0), default=None,
+                    help="search for a value at codeword CW_IDX such that "
+                         "the resulting decode of the vector table is "
+                         "structurally valid (handler targets >= 0x00A4 "
+                         "or in upper memory). Combine with --anchors "
+                         "for the base anchor set. Tries values 0x0000-"
+                         "0xFFFF and reports candidates by structural score.")
+    ap.add_argument("--search-range", metavar="LO:HI", default="0:0x10000",
+                    help="value range for --search-anchor (default 0:0x10000)")
+    ap.add_argument("--vector-table-end", metavar="ADDR",
+                    type=lambda s: int(s, 0), default=0xA4,
+                    help="chip address where the vector table ends (default "
+                         "0xA4 = 82 vectors × 2 words). Used by --search-anchor "
+                         "to validate handler targets.")
     ap.add_argument("--only-standard", action="store_true",
                     help="exclude anomalous frames from decode")
     args = ap.parse_args(argv)
@@ -1005,6 +1020,128 @@ def main(argv=None) -> int:
                 pid_str = "(%X,%X,%X,%X)" % pair_rows[c]
                 print(f"    cw {c:>6d}  pair-ids {pid_str}",
                       file=sys.stderr)
+        return 0
+
+    if args.search_anchor is not None:
+        cw_idx = args.search_anchor
+        lo_str, hi_str = args.search_range.split(":")
+        val_lo = int(lo_str, 0)
+        val_hi = int(hi_str, 0)
+        vt_end = args.vector_table_end
+
+        if cw_idx >= len(pair_rows):
+            print(f"--search-anchor: codeword index {cw_idx} out of range "
+                  f"(have {len(pair_rows)} codewords)", file=sys.stderr)
+            return 2
+
+        # Vector table layout: starts at codeword 6 (after 6-codeword boundary).
+        # Each vector = 2 codewords (opcode + target). 82 vectors total.
+        # Vector N target codeword = 6 + N*2 + 1.
+        vec_target_cws = [6 + n * 2 + 1 for n in range(82)]
+
+        # JSR <ABS19> opcode template = 0xE254. Targets that come after JSR (vec 2-81)
+        # are 16-bit addresses for in-program-flash targets. JMP targets (vec 0,1)
+        # similarly. All vector targets should be valid addresses on the chip.
+
+        def is_valid_target(value: int) -> bool:
+            """A vector target is structurally valid if it's:
+            - >= vector_table_end (post-vector-table program flash), OR
+            - >= 0x8000 (upper memory: data flash, boot flash, etc.)
+            """
+            return value >= vt_end or value >= 0x8000
+
+        print(f"\nSearching for cw {cw_idx} value such that decoded vector "
+              f"targets are structurally valid:", file=sys.stderr)
+        print(f"  Considering values 0x{val_lo:04X} .. 0x{val_hi:04X}",
+              file=sys.stderr)
+        print(f"  Vector table end address: 0x{vt_end:04X}", file=sys.stderr)
+        print(f"  Valid target: addr >= 0x{vt_end:04X} OR addr >= 0x8000",
+              file=sys.stderr)
+        print(f"  Base anchors: {len(anchors)}", file=sys.stderr)
+        print(file=sys.stderr)
+
+        # Quick consistency check function
+        def try_value(value: int) -> dict | None:
+            """Try anchoring cw_idx to value; return scoring info or None on conflict."""
+            test_anchors = list(anchors) + [(cw_idx, value)]
+            try:
+                mappings = derive_mappings(pair_rows, test_anchors, nibble_order)
+            except ValueError:
+                return None  # contradiction
+
+            # Decode all 82 vector targets
+            targets = []
+            for vt_cw in vec_target_cws:
+                if vt_cw >= len(pair_rows):
+                    return None
+                pids = pair_rows[vt_cw]
+                # Decode using mappings
+                v = 0
+                for p in range(4):
+                    nib = mappings[p][pids[p]]
+                    v |= nib << (12 - 4 * nibble_order[p])
+                targets.append(v)
+
+            # Score: number of valid targets
+            n_valid = sum(1 for t in targets if is_valid_target(t))
+            return {
+                "value": value,
+                "targets": targets,
+                "n_valid": n_valid,
+                "n_total": len(targets),
+            }
+
+        # Search
+        results = []
+        n_tested = 0
+        n_consistent = 0
+        for v in range(val_lo, val_hi):
+            r = try_value(v)
+            n_tested += 1
+            if r is None:
+                continue
+            n_consistent += 1
+            results.append(r)
+
+        print(f"  Tested {n_tested} values, {n_consistent} mathematically consistent",
+              file=sys.stderr)
+
+        # Filter: only show results where ALL 82 targets are valid
+        perfect = [r for r in results if r["n_valid"] == r["n_total"]]
+        # Sort by valid count descending
+        results.sort(key=lambda r: -r["n_valid"])
+
+        if perfect:
+            print(f"\n  *** {len(perfect)} value(s) give ALL 82 vectors valid! ***",
+                  file=sys.stderr)
+            from collections import Counter
+            for r in perfect[:30]:
+                tc = Counter(r["targets"])
+                default, n_default = tc.most_common(1)[0]
+                specifics = sorted(t for t, n in tc.items() if n < n_default)
+                spec_str = ", ".join(f"0x{t:04X}" for t in specifics)
+                print(f"    cw {cw_idx} = 0x{r['value']:04X}: "
+                      f"default=0x{default:04X} ({n_default}×), "
+                      f"specifics=[{spec_str}]", file=sys.stderr)
+        else:
+            print(f"\n  No value gives all 82 vectors valid. "
+                  f"Top 10 by score:", file=sys.stderr)
+            from collections import Counter
+            for r in results[:10]:
+                tc = Counter(r["targets"])
+                default, n_default = tc.most_common(1)[0]
+                # Find which targets are INVALID (inside vector table)
+                invalid = sorted({t for t in r["targets"]
+                                  if not (t >= vt_end or t >= 0x8000)})
+                inv_str = ", ".join(f"0x{t:04X}" for t in invalid)
+                print(f"    cw {cw_idx} = 0x{r['value']:04X}: "
+                      f"{r['n_valid']}/{r['n_total']} valid, "
+                      f"default=0x{default:04X}, invalid=[{inv_str}]",
+                      file=sys.stderr)
+            print(file=sys.stderr)
+            print(f"  Try a different cw_idx, expand --search-range, or "
+                  f"check if base anchors are correct.", file=sys.stderr)
+
         return 0
 
     if args.inspect:
