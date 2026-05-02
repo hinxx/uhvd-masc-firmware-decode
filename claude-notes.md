@@ -2515,3 +2515,70 @@ The real path forward, as I mentioned before, is **decoding the metadata field**
 What I'd actually do at this point: commit to the partial decode, save `decoded.bin`, and try feeding it to a 56800E disassembler to see how much of the structure recovers. The 14 pinned + heuristic-driven decode is probably good enough to identify ~70% of opcodes correctly, which is enough to read the firmware's overall logic.
 
 
+You're right on both counts. Let me re-examine carefully:**This is enormously informative.** Look at the dummy structure:
+
+- Vector 0: `JSR 0x0000` with **opcode `0xE256`** (= JSR with bit 17 of address set, meaning target is in boot flash at `0x20000`)
+- Vectors 1+: `JSR 0x00xx` (low addresses) — including `0x00A4` for default, `0x00A8`, `0x00AC`, `0x00B0`, `0x00B4` for specific handlers
+- **Right after the vector table at 0x148**, the dummy has `54 e2 a4 00` — that's **JSR 0x00A4 again**! And then `0x14C` onwards is real code (`01 e7 00 e7 ...`)
+
+Wait — that's two more JSRs at offsets `0x140` and `0x144` *inside* the vector table. The dummy has **81 JSRs** (not 82), with vector 0 being a different opcode `0xE256` (the one with address bit set).
+
+Now the key insight: **all 81 JSR targets in the dummy have high byte = 0x00**. Every single one. So your hypothesis is exactly right — for a typical 56F8345 firmware, **vector targets have `0x00` high byte**.
+
+Let me apply this constraint to our firmware:**Important catch.** The anchor `cw 19 = 0x00A4` *conflicts* — its low nibble (`4`) clashes with JMP's pos 2 pid E mapping to nibble 4. 
+
+The bijection requires **nib idx 3 (= pos 2)** to be uniquely assigned per pid. JMP `0xE154` already pinned pos 2 pid E → 4. If `cw 19` (default handler) had pair-id `0` at pos 2 and decoded with low nibble `4`, two different pos-2 pids would both map to nibble 4. Bijection violation.
+
+**This means default handler does NOT end with `0x?4`.** Let me find what low nibbles ARE allowed:Excellent — but wait, I should ALSO note: looking at the dummy's values, the default handler **0x00A4** is at offset `0x148` in the file. After the vector table ends at `0x144`, position `0x148` IS the next address (which is `0x148/2 = 0xA4` in word terms). **The default handler is literally the first instruction after the vector table!**
+
+This is a huge clue. The default handler in our firmware is similarly the **first executable code after the vector table**. Let me think about what address that is:Wait — I want to double-check this conflict by running the actual decoder rather than my by-hand reasoning, and also follow your **stronger hypothesis** which is the cleanest test: every vector target has high byte = 0x00. Let me build that test:Now I see more clearly. Your hypothesis is structurally **mostly right** — but with the constraint that **only the default handler** (74 vectors sharing pid 4 at pos 0) has guaranteed high byte 0x00. Specific handlers can have other high bytes because they use different pos 0 pids.
+
+Let me give you the practical recommendations to test this:## Summary: you're right, and here's what to do
+
+**Your two key observations:**
+
+1. **The FFFF runs near end of file aren't a single contiguous erased region** — they're broken up. So they're not necessarily program-flash trailer; could be data flash region (Harvard architecture, separate from code).
+
+2. **0x00A4 in the dummy is "first address after the 82-entry vector table"** — that's where the default handler lives. The same logic should apply to our firmware.
+
+**What the math tells us:**
+
+The "all 82 targets have high byte 0x00" hypothesis can't be **literally true** — we have at least 3 distinct pos-0 pair-ids (4, 8, B) appearing in target codewords, and bijection forbids them all mapping to nibble 0.
+
+**But the weaker hypothesis** ("the 74 *default-handler* targets all share high byte 0x00") is fully consistent. They all have the same pid pattern, so they share one mapping.
+
+**Concrete recommendation:**
+
+```bash
+# Drop the cw 17 = 0x7015 anchor (almost certainly wrong)
+# Anchor cw 19 with high byte = 0x00 (your insight)
+
+echo '[
+  [41124, "0xFFFF"],
+  [6, "0xE154"],
+  [10, "0xE254"],
+  [19, "0x0008"]
+]' > anchors.json
+
+python3 dsp56800e_decoder.py firmware.elf.e --skip 13 \
+    --anchors anchors.json --nibble-order 0231 --check-anchors
+```
+
+The choice of `0x0008` vs other low byte: doesn't matter much for testing the hypothesis. The important thing is **forcing the high byte to 0x00**. If "Consistent: True", we've gained 4 new pins (pos 0 pid 4 → 0, pos 1 pid A → 0, pos 2 pid 0 → 8, pos 3 pid D → 0).
+
+Then decode and look:
+
+```bash
+python3 dsp56800e_decoder.py firmware.elf.e --skip 13 \
+    --anchors anchors.json --nibble-order 0231 --byte-order little \
+    -o decoded.bin
+hexdump -Cv decoded.bin | head -25
+```
+
+If hypothesis is right, **all 74 default vectors should now decode as `0x0008`** (or whatever you anchored). The specific-handler vectors will decode as `0x?? ??` where the pos 0 pid is different and gets a heuristic guess — but those guesses will be from the *new* heuristic state with more pins, so they'll be more accurate.
+
+Importantly: if you see vector 5's target now as `0x?008` or similar pattern, that confirms the address layout. Try a few different low-byte values to see which produces the "cleanest" decode (sensible code starting right after the vector table at 0x148).
+
+Try the `0x0008` anchor and paste the decoded output — we'll iterate from there. The fact that you correctly identified the **structural layout principle** (default handler = first code after vector table) is the single most useful piece of progress in this whole session.
+
+
