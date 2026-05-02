@@ -2582,3 +2582,101 @@ Importantly: if you see vector 5's target now as `0x?008` or similar pattern, th
 Try the `0x0008` anchor and paste the decoded output — we'll iterate from there. The fact that you correctly identified the **structural layout principle** (default handler = first code after vector table) is the single most useful piece of progress in this whole session.
 
 
+**This decode is dramatically better.** Look at the structure that emerged:
+
+```
+0x00: f5 e2 46 44   <- boundary frame
+0x04: 66 e1 8b 46
+0x08: 56 41 56 e1
+0x0C: 54 e1 5f df   <- vec 0: JMP 0xDF5F  (reset)
+0x10: 54 e1 5f df   <- vec 1: JMP 0xDF5F  (COP)
+0x14: 54 e2 78 00   <- vec 2: JSR 0x0078  (illegal)
+0x18: 54 e2 08 00   <- vec 3: JSR 0x0008  (default)
+0x1C: 54 e2 d8 00   <- vec 4: JSR 0x00D8  (HW stack overflow)
+0x20: 54 e2 88 00   <- vec 5: JSR 0x0088  (misalign)
+0x24-0x58: JSR 0x0008 (default, many)
+0x5C: 54 e2 af 98   <- vec ??: JSR 0x98AF  (LVD or similar?)
+0x60: 54 e2 08 b0   <- vec ??: JSR 0xB008  (PLL?)
+0x64-0x144: JSR 0x0008 (default)
+0x148: 54 e2 ff 11  <- vec 78: JSR 0x11FF  (specific)
+0x14C-0x150: JSR 0x0008 (default)
+```
+
+Now this looks **exactly like the dummy firmware structure**. Specific handlers at low addresses (`0x0078`, `0x0088`, `0x00D8`), default at `0x0008`. The vector table runs from `0x0C` to `0x153` — 84 entries × 4 bytes... actually wait, let me count properly:**Beautiful.** The vector table is now reading **almost exactly like the dummy CodeWarrior firmware structure**:
+
+| Vec | Target | Role |
+|---|---|---|
+| 0,1 | 0xDF5F | Reset/COP → startup |
+| 2 | 0x0078 | illegal instruction handler |
+| 3 | 0x0008 | default |
+| 4 | 0x00D8 | HW stack overflow handler |
+| 5 | 0x0088 | misalign handler |
+| 6-19 | 0x0008 | default |
+| 20 | 0x98AF | LVD (special, in upper memory) |
+| 21 | 0xB008 | PLL (special, in upper memory) |
+| 22-77, 79-81 | 0x0008 | default |
+| 78 | 0x11FF | specific (this was the suspicious one — now resolves cleanly) |
+
+This matches the dummy's pattern perfectly: low addresses (0x00xx) for most handlers, with a few specific ones in upper memory (0x98AF, 0xB008). Vector 78's target `0x11FF` is now plausible — it's in low memory range.
+
+Now there's still some heuristic uncertainty though — let me notice a few things:**Important caveat I just noticed.** Although the decode looks pretty, **`0x0008` as default-handler address is structurally invalid** — it points inside the vector table itself.
+
+The default handler must be at chip word ≥ 0xA4 (after the 82-entry table). But `0x00A4` conflicts. Let me find values that are both structurally valid AND consistent:Look at the pattern! The decoded output you have shows specific handlers at:
+
+- vec 2 (illegal): `0x0078`
+- vec 4 (HW stack overflow): `0x00D8`
+- vec 5 (misalign): `0x0088`
+
+These are **all valid post-vector-table addresses (≥ 0xA4)** for handlers... wait, no:
+
+- `0x0078` = chip word 0x78 = inside vector table (vector entries 0-81 occupy chip words 0-0xA3)
+- `0x0088` = chip word 0x88 = also inside
+- `0x00D8` = chip word 0xD8 = AFTER vector table ✓
+
+So vec 2 and vec 5 targets `0x0078` and `0x0088` are also structurally inside the vector table! That means **either**:
+1. Our anchor `cw 19 = 0x0008` was wrong (and propagated wrong values everywhere), OR
+2. The address space convention is different than I think
+
+Actually let me reconsider. Look at the dummy more carefully:## Honest assessment of where we are
+
+**Good news:** The decode structure is now genuinely better than before. The vector table reads cleanly:
+- 74 default handlers all sharing one target
+- 8 specific handlers at distinguishable addresses
+- Pattern matches the 56F8345 dummy firmware layout
+
+**The catch:** `0x0008` as default-handler address is **structurally impossible** — it points inside the vector table itself. Same problem with `0x0078`, `0x0088`. These addresses are below `0xA4` (= `82 vectors × 2 words = 164 words`) where the vector table ends.
+
+**What this means:** Our anchor `cw 19 = 0x0008` propagated values that are **structurally wrong but internally consistent**. The decode preserves *relative* structure (which targets are equal, which differ) but the absolute addresses are shifted/wrong.
+
+The conflict between "default = 0x00A4 (matches dummy structure)" and "low nibble 4 conflicts with JMP anchor pos 2 pid E → 4" suggests **one of our anchors is wrong**:
+
+1. **Maybe JMP opcode isn't `0xE154`** in this firmware. The DSP56800E reference shows multiple JMP encoding forms (with various address bits set). If our vector table uses a slightly different form (say, `0xE954`), the pos 2 pinning would change.
+
+2. **Maybe nibble-order isn't exactly `0231`.** We picked it based on JMP/JSR consistency, but if those opcode assumptions were slightly wrong, the order is too.
+
+3. **Maybe `(C, B, 5, 9)` isn't `0xFFFF`** — your original concern. If it's `0x0000` instead, the FFFF→0000 mapping flips at all positions, which would change everything.
+
+## Updated recommendation
+
+Try anchor `cw 19 = 0x00A8` (nearest valid alternative to `0x00A4`):
+
+```bash
+echo '[
+  [41124, "0xFFFF"],
+  [6, "0xE154"],
+  [10, "0xE254"],
+  [19, "0x00A8"]
+]' > anchors.json
+
+python3 dsp56800e_decoder.py firmware.elf.e --skip 13 \
+    --anchors anchors.json --nibble-order 0231 --check-anchors
+```
+
+This should be Consistent: True, and would produce a default handler at `0x00A8` (4 words into post-vector-table code, room for some prologue).
+
+Then decode and look at byte `0x14C` onwards (= chip word `0xA4` onwards = first code after vector table). If the heuristic-decoded code looks like real DSP56800E instructions there, we're on track.
+
+If even `0x00A8` produces weird-looking code right after the vector table, that's strong evidence the JMP/JSR anchor assumption (or nibble order, or FFFF=0xFFFF) is wrong somewhere fundamental.
+
+What this run gave us is **proof of concept** — your insight about low-byte addresses is clearly right structurally. We just need to find the *exact* low-byte that doesn't conflict. Try `0x00A8` next.
+
