@@ -1,0 +1,13 @@
+hinxx@obZen:~/ess/uhvd-masc-firmware-decode$ python3 dsp56800e_decoder_2.py firmware.elf.e --skip 13     --bijection-json counter_bijection_extrapolated.json     --nibble-order 0123     -o decoded_counter.bin
+[+] loaded 192753 bytes from firmware.elf.e
+[+] 1150 frames; payload after strip: 174288 bytes
+[+] 64 direct bijection pin(s) loaded
+[+] derived pair-id -> nibble mappings (P = pinned by anchor, h = heuristic):
+  pos 0: 0->CP  1->DP  2->AP  3->BP  4->EP  5->FP  6->8P  7->9P  8->4P  9->5P  A->6P  B->7P  C->0P  D->1P  E->2P  F->3P  
+  pos 1: 0->FP  1->DP  2->EP  3->BP  4->CP  5->AP  6->5P  7->4P  8->7P  9->6P  A->1P  B->0P  C->3P  D->2P  E->9P  F->8P  
+  pos 2: 0->9P  1->8P  2->3P  3->2P  4->1P  5->0P  6->7P  7->6P  8->5P  9->4P  A->CP  B->BP  C->AP  D->FP  E->EP  F->DP  
+  pos 3: 0->AP  1->CP  2->BP  3->EP  4->DP  5->FP  6->9P  7->8P  8->1P  9->0P  A->3P  B->2P  C->5P  D->4P  E->7P  F->6P  
+[+] first 8 words: 5052 4F47 5241 4D26 4441 5441 54E1 A400
+[+] last  8 words: 0182 D042 8043 4183 0041 D181 8180 4040
+[+] wrote 87144 bytes to decoded_counter.bin
+hinxx@obZen:~/ess/uhvd-masc-firmware-decode$ hexdump -Cv decoded_counter.bin > decoded_counter.txt 
