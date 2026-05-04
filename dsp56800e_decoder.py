@@ -37,7 +37,7 @@ Decoding pipeline:
     2. strip_framing      — concatenate payload bytes (drop sync,
                             FFFF-marker, metadata, and tag from each).
     3. decode_pair_indices — bytes → pair-id (0..15) tuples.
-    4. derive_mappings    — pair-id → nibble (needs anchors).
+    4. derive_mappings    — pair-id → nibble.
     5. apply_mappings     — produce final 16-bit words.
 
 What is fully known:
@@ -45,13 +45,13 @@ What is fully known:
     every byte position, and the XOR-pair structure.  Stages 1–3 are
     deterministic and need no extra information.
 
-What requires anchors:
+What requires a bijection:
     The bijection pair-id → nibble at each of the four positions
-    cannot be determined from the histogram alone.  Pass anchors
-    (codeword-index, expected-word) to derive_mappings.  Reliable
-    anchors include 0xFFFF (erased flash, found via --find-runs)
-    and the JMP/JSR opcodes 0xE154/0xE254 at the start of the
-    vector table (see DSP56800E reference manual).
+    cannot be determined from the histogram alone.  Pass direct
+    pair-id pins with --bijection-json when a mapping is known.
+    Without direct pins, derive_mappings() falls back to a frequency
+    heuristic that is useful for inspection but probably not a correct
+    firmware decode.
 """
 
 from __future__ import annotations
@@ -356,35 +356,31 @@ def decode_pair_indices(payload: bytes) -> list[tuple[int, int, int, int]]:
 
 
 # ============================================================================
-# Stage 4 — derive pair-id → nibble mapping from anchors
+# Stage 4 — derive pair-id → nibble mapping
 # ============================================================================
 
 # Heuristic frequency rank for unconstrained nibbles in DSP firmware.
 # 0xF dominates (sign-extension, erased flash, immediate -1); 0x0 is
 # common (small constants, MSBs of low values).  The remainder is a
-# rough guess used only as a tie-break when no anchor pins the value.
+# rough guess used only as a tie-break when no direct pin fixes the value.
 DEFAULT_NIBBLE_RANK = (0xF, 0x0, 0x1, 0x2, 0x4, 0x8, 0x6, 0xE,
                        0x3, 0x5, 0x7, 0xA, 0x9, 0xC, 0xB, 0xD)
 
 
 def derive_mappings(pair_rows: Sequence[tuple[int, int, int, int]],
-                    anchors: Iterable[tuple[int, int]] = (),
                     nibble_order: tuple[int, int, int, int] = (0, 1, 2, 3),
                     rank: Sequence[int] = DEFAULT_NIBBLE_RANK,
                     direct_pins: Iterable[tuple[int, int, int]] = (),
                     ) -> tuple[dict, dict, dict, dict]:
-    """Derive per-position pair-id → nibble mappings from anchors.
+    """Derive per-position pair-id → nibble mappings.
 
     Args:
         pair_rows: output of decode_pair_indices().
-        anchors: iterable of (codeword_index, expected_16bit_word_value).
-            Each anchor pins the four nibbles of the expected word at
-            their respective byte positions.
         nibble_order: which nibble of the 16-bit output word each byte
             position carries.  (0,1,2,3) means pos 0 → bits 15:12,
             pos 1 → 11:8, pos 2 → 7:4, pos 3 → 3:0  (big-endian within
             the word).  Use (3,2,1,0) for little-endian.
-        rank: tie-break order for nibbles not pinned by any anchor.
+        rank: tie-break order for nibbles not pinned directly.
         direct_pins: iterable of (pos, pair_id, nibble) tuples, applied
             as direct bijection pins (no codeword involved). Useful for
             externally-derived bijection constraints.
@@ -394,9 +390,8 @@ def derive_mappings(pair_rows: Sequence[tuple[int, int, int, int]],
         pair-id (0..15) → nibble (0..15).
 
     Raises:
-        ValueError on contradictory or infeasible anchors.
+        ValueError on contradictory or infeasible direct pins.
     """
-    n = len(pair_rows)
     cands = [{pid: set(range(16)) for pid in range(16)} for _ in range(4)]
 
     # Apply direct pins first.
@@ -412,19 +407,6 @@ def derive_mappings(pair_rows: Sequence[tuple[int, int, int, int]],
                 f"direct pin (pos={pos}, pid={pid}, nib={nib}) contradicts "
                 f"existing constraints")
         cands[pos][pid] = {nib}
-
-    # Apply anchors.
-    for cw, expected in anchors:
-        if not (0 <= cw < n):
-            raise IndexError(f"anchor codeword index {cw} out of range")
-        nibs = [(expected >> (12 - 4 * nibble_order[p])) & 0xF
-                for p in range(4)]
-        for p in range(4):
-            pid = pair_rows[cw][p]
-            cands[p][pid] &= {nibs[p]}
-            if not cands[p][pid]:
-                raise ValueError(
-                    f"contradictory anchors at codeword {cw} position {p}")
 
     # Bijection propagation: each nibble must appear in exactly one pair
     # at each position.
@@ -486,8 +468,8 @@ def find_constant_runs(pair_rows: Sequence[tuple[int, int, int, int]],
                        top_n: int = 20,
                        ) -> list[dict]:
     """Find the longest runs of identical codewords in the pair-id
-    stream.  Long runs strongly suggest erased-flash padding (0xFFFF)
-    or zero-initialized data (0x0000); both make excellent anchors.
+    stream.  Long runs may suggest erased-flash padding (0xFFFF)
+    or zero-initialized data (0x0000).
 
     Returns up to `top_n` runs sorted by length, each as a dict:
         {"start": codeword index, "length": run length,
@@ -526,9 +508,9 @@ def inspect_codewords(pair_rows: Sequence[tuple[int, int, int, int]],
                       ) -> list[dict]:
     """Show pair-ids around given codeword indices, with context.
 
-    Useful for examining the decoded structure at known anchor
-    locations (e.g., near the end of program flash where the
-    configuration field lives).
+    Useful for examining the decoded structure at known locations
+    (e.g., near the end of program flash where the configuration
+    field lives).
     """
     out = []
     for idx in indices:
@@ -543,18 +525,18 @@ def inspect_codewords(pair_rows: Sequence[tuple[int, int, int, int]],
 
 def find_candidate_words(pair_rows: Sequence[tuple[int, int, int, int]],
                          target: int,
-                         existing_anchors: Iterable[tuple[int, int]] = (),
+                         direct_pins: Iterable[tuple[int, int, int]] = (),
                          search_range: tuple[int, int] | None = None,
                          nibble_order: tuple[int, int, int, int] = (0, 1, 2, 3),
                          ) -> list[int]:
     """Find every codeword index where assuming the codeword == `target`
-    is consistent with the existing anchor mappings (no contradictions
-    on already-pinned pair-ids).
+    is consistent with direct bijection pins (no contradictions on
+    already-pinned pair-ids).
 
     Args:
         pair_rows: pair-id stream.
         target: 16-bit value to search for.
-        existing_anchors: already-known anchors, used to constrain.
+        direct_pins: already-known direct bijection pins, used to constrain.
         search_range: (start, end) codeword indices to search; defaults
             to whole stream.
         nibble_order: per-byte-position nibble layout.
@@ -564,24 +546,16 @@ def find_candidate_words(pair_rows: Sequence[tuple[int, int, int, int]],
         Use these to narrow down where a specific known value is located.
 
     Example:
-        # Find all positions where assuming the codeword = 0xE70A is
-        # consistent with the FFFF anchor we already have.
-        candidates = find_candidate_words(rows, 0xE70A,
-                                          existing_anchors=[(43250, 0xFFFF)])
+        candidates = find_candidate_words(rows, 0xE70A, direct_pins=pins)
     """
-    # Build per-position pair-id -> nibble constraints from existing anchors.
+    # Build per-position pair-id -> nibble constraints from direct pins.
     pinned = [{} for _ in range(4)]
     used_nibs = [set() for _ in range(4)]
-    for cw_idx, w in existing_anchors:
-        for p in range(4):
-            shift = 12 - 4 * nibble_order[p]
-            nb = (w >> shift) & 0xF
-            pid = pair_rows[cw_idx][p]
-            if pid in pinned[p] and pinned[p][pid] != nb:
-                # Contradictory anchors — skip; we'd have caught this elsewhere.
-                pass
-            pinned[p][pid] = nb
-            used_nibs[p].add(nb)
+    for pos, pid, nb in direct_pins:
+        if pid in pinned[pos] and pinned[pos][pid] != nb:
+            continue
+        pinned[pos][pid] = nb
+        used_nibs[pos].add(nb)
 
     # Compute target nibbles
     target_nibs = [(target >> (12 - 4 * nibble_order[p])) & 0xF
@@ -609,90 +583,6 @@ def find_candidate_words(pair_rows: Sequence[tuple[int, int, int, int]],
         if ok:
             candidates.append(i)
     return candidates
-
-
-def add_anchor_consistency_check(pair_rows: Sequence[tuple[int, int, int, int]],
-                                 anchors: Iterable[tuple[int, int]],
-                                 nibble_order: tuple[int, int, int, int] = (0, 1, 2, 3),
-                                 direct_pins: Iterable[tuple[int, int, int]] = (),
-                                 ) -> dict:
-    """Validate a set of candidate anchors for mutual consistency.
-
-    Args:
-        pair_rows: codeword pair-ids.
-        anchors: codeword-based anchors as (cw_idx, expected_word).
-        nibble_order: nibble ordering convention.
-        direct_pins: optional direct (pos, pid, nibble) pins to combine.
-
-    Returns:
-        {
-            "consistent": bool,
-            "contradictions": list of conflict descriptions,
-            "pinned_per_position": list of int (pair-ids pinned per pos),
-            "duplicate_nibbles": list of (position, nibble, [pair_ids])
-                — same nibble assigned to multiple pair-ids,
-        }
-    """
-    pinned = [{} for _ in range(4)]
-    contradictions = []
-
-    # Apply direct pins first.
-    for pos, pid, nb in direct_pins:
-        if pid in pinned[pos]:
-            prev_nb, prev_src = pinned[pos][pid]
-            if prev_nb != nb:
-                contradictions.append({
-                    "position": pos,
-                    "pair_id": pid,
-                    "nibble_a": prev_nb,
-                    "nibble_b": nb,
-                    "source_a": prev_src,
-                    "source_b": "direct_pin",
-                })
-        else:
-            pinned[pos][pid] = (nb, "direct_pin")
-
-    anchors = list(anchors)
-    for ai, (cw_idx, w) in enumerate(anchors):
-        for p in range(4):
-            shift = 12 - 4 * nibble_order[p]
-            nb = (w >> shift) & 0xF
-            pid = pair_rows[cw_idx][p]
-            if pid in pinned[p]:
-                prev_nb, prev_src = pinned[p][pid]
-                if prev_nb != nb:
-                    if isinstance(prev_src, int):
-                        anc_a = (anchors[prev_src], prev_src)
-                    else:
-                        anc_a = prev_src  # "direct_pin" string
-                    contradictions.append({
-                        "anchor_a": anc_a,
-                        "anchor_b": (anchors[ai], ai),
-                        "position": p,
-                        "nibble_a": prev_nb,
-                        "nibble_b": nb,
-                        "pair_id": pid,
-                    })
-            else:
-                pinned[p][pid] = (nb, ai)
-
-    # Check for nibble duplicates (different pair-ids assigned same nibble)
-    duplicates = []
-    for p in range(4):
-        nib_to_pids = {}
-        for pid, (nb, _) in pinned[p].items():
-            nib_to_pids.setdefault(nb, []).append(pid)
-        for nb, pids in nib_to_pids.items():
-            if len(pids) > 1:
-                duplicates.append({"position": p, "nibble": nb, "pair_ids": pids})
-
-    return {
-        "consistent": not contradictions and not duplicates,
-        "contradictions": contradictions,
-        "pinned_per_position": [len(pinned[p]) for p in range(4)],
-        "duplicate_nibbles": duplicates,
-    }
-
 
 def decode_tag_high_bytes(frames: Sequence[dict],
                           mappings: Sequence[dict],
@@ -735,16 +625,16 @@ def decode_tag_high_bytes(frames: Sequence[dict],
 # ============================================================================
 
 def decode_file(path: str | Path,
-                anchors: Iterable[tuple[int, int]] = (),
                 nibble_order: tuple[int, int, int, int] = (0, 1, 2, 3),
                 only_standard: bool = False,
+                direct_pins: Iterable[tuple[int, int, int]] = (),
                 ) -> dict:
     """One-shot: read encoded file, return everything."""
     data = Path(path).read_bytes()
     payload, frames, anomalous = strip_framing(
         data, only_standard=only_standard)
     pair_rows = decode_pair_indices(payload)
-    mappings = derive_mappings(pair_rows, anchors, nibble_order)
+    mappings = derive_mappings(pair_rows, nibble_order, direct_pins=direct_pins)
     words = apply_mappings(pair_rows, mappings, nibble_order)
     return {
         "input_size": len(data),
@@ -872,8 +762,6 @@ def main(argv=None) -> int:
                     help="write decoded 16-bit words here")
     ap.add_argument("--raw-payload",
                     help="write framing-stripped payload here (no nibble decode)")
-    ap.add_argument("--anchors",
-                    help='JSON: [[cw_idx, word], ...] e.g. [[45896, "0xE70A"]]')
     ap.add_argument("--nibble-order", default="0123",
                     help="byte-pos to nibble-pos mapping; '0123' (default) "
                          "= big-endian within word, '3210' = little-endian")
@@ -889,13 +777,11 @@ def main(argv=None) -> int:
     ap.add_argument("--find-runs", type=int, metavar="N", nargs="?",
                     const=15, default=None,
                     help="find the N longest constant-codeword runs and "
-                         "exit (default N=15); use this to identify "
-                         "anchor candidates for 0xFFFF / 0x0000")
+                         "exit (default N=15)")
     ap.add_argument("--find-value", metavar="HEX",
                     help="find every codeword index where assuming "
-                         "codeword == HEX is consistent with --anchors; "
-                         "use to locate known constants like 0xE70A "
-                         "(SECL_VALUE) given the FFFF anchor")
+                         "codeword == HEX is consistent with direct "
+                         "bijection pins")
     ap.add_argument("--find-near", metavar="IDX:RADIUS",
                     help="restrict --find-value search to IDX±RADIUS "
                          "(codeword indices, e.g. '45799:20')")
@@ -907,16 +793,13 @@ def main(argv=None) -> int:
                          "like '-1') or a range 'A..B' (inclusive). "
                          "Examples: '0,5,last:1' or '0..7' or 'last:25' "
                          "or '45799,-1'")
-    ap.add_argument("--check-anchors", action="store_true",
-                    help="validate the anchors in --anchors for mutual "
-                         "consistency and report nibble coverage")
     ap.add_argument("--bijection-json", metavar="PATH",
                     help="JSON file with explicit pair-id -> nibble bijection "
                          "constraints, in the format produced by "
                          "analyze_frame_headers.py --emit-counter-constraints. "
                          "Format: {'pinned': [{pos0_map}, {pos1_map}, ...]}. "
-                         "These are added on top of any --anchors as direct "
-                         "(pos, pid, nibble) pins. Useful for testing whether "
+                         "These direct (pos, pid, nibble) pins are useful "
+                         "for testing whether "
                          "an externally-derived bijection (e.g. from metadata "
                          "counter analysis) is also valid for payload decoding.")
     ap.add_argument("--search-anchor", metavar="CW_IDX",
@@ -924,9 +807,8 @@ def main(argv=None) -> int:
                     help="search for a value at codeword CW_IDX such that "
                          "the resulting decode of the vector table is "
                          "structurally valid (handler targets >= 0x00A4 "
-                         "or in upper memory). Combine with --anchors "
-                         "for the base anchor set. Tries values 0x0000-"
-                         "0xFFFF and reports candidates by structural score.")
+                         "or in upper memory). Tries values 0x0000-0xFFFF "
+                         "and reports candidates by structural score.")
     ap.add_argument("--search-range", metavar="LO:HI", default="0:0x10000",
                     help="value range for --search-anchor (default 0:0x10000)")
     ap.add_argument("--vector-table-end", metavar="ADDR",
@@ -991,12 +873,8 @@ def main(argv=None) -> int:
             print(f"\nLongest run: {top['length']} consecutive codewords "
                   f"with pair-ids {top['pair_ids']}",
                   file=sys.stderr)
-            print(f"In real DSP firmware this is almost always 0xFFFF "
-                  f"(erased flash).  Suggested anchor:",
-                  file=sys.stderr)
-            print(f'  echo \'[[{top["start"]}, "0xFFFF"]]\' > anchors.json',
-                  file=sys.stderr)
-            print(f"Then re-run with --anchors anchors.json to decode.",
+            print(f"In real DSP firmware this may indicate erased flash "
+                  f"(0xFFFF) or zero-initialized data (0x0000).",
                   file=sys.stderr)
 
         print(f"\nTop {len(freqs)} most common codewords overall:",
@@ -1012,17 +890,6 @@ def main(argv=None) -> int:
     if sorted(nibble_order) != [0, 1, 2, 3]:
         print("--nibble-order must be a permutation of 0123", file=sys.stderr)
         return 2
-
-    # Load anchors (used by every remaining mode).
-    anchors: list[tuple[int, int]] = []
-    if args.anchors:
-        raw = json.loads(Path(args.anchors).read_text())
-
-        def _to_int(x):
-            return int(x, 0) if isinstance(x, str) else int(x)
-
-        anchors = [(_to_int(idx), _to_int(word)) for idx, word in raw]
-        print(f"[+] {len(anchors)} anchor(s) loaded", file=sys.stderr)
 
     # Load direct bijection pins from JSON (e.g. counter constraints).
     direct_pins: list[tuple[int, int, int]] = []
@@ -1040,41 +907,6 @@ def main(argv=None) -> int:
         print(f"[+] {len(direct_pins)} direct bijection pin(s) loaded",
               file=sys.stderr)
 
-    if args.check_anchors:
-        result = add_anchor_consistency_check(pair_rows, anchors, nibble_order,
-                                              direct_pins=direct_pins)
-        print(f"\nAnchor consistency check:", file=sys.stderr)
-        print(f"  Total anchors    : {len(anchors)}", file=sys.stderr)
-        if direct_pins:
-            print(f"  Direct pins      : {len(direct_pins)}", file=sys.stderr)
-        print(f"  Consistent       : {result['consistent']}",
-              file=sys.stderr)
-        print(f"  Pinned per position (out of 16):",
-              file=sys.stderr)
-        for p in range(4):
-            print(f"    pos {p}: {result['pinned_per_position'][p]}",
-                  file=sys.stderr)
-        if result['contradictions']:
-            print(f"\nContradictions ({len(result['contradictions'])}):",
-                  file=sys.stderr)
-            for c in result['contradictions']:
-                print(f"  pos {c['position']}: pair-id {c['pair_id']:X} "
-                      f"assigned both {c['nibble_a']:X} and {c['nibble_b']:X}",
-                      file=sys.stderr)
-                print(f"    by anchor #{c['anchor_a'][1]}: "
-                      f"{c['anchor_a'][0]} and "
-                      f"#{c['anchor_b'][1]}: {c['anchor_b'][0]}",
-                      file=sys.stderr)
-        if result['duplicate_nibbles']:
-            print(f"\nDuplicate nibbles "
-                  f"({len(result['duplicate_nibbles'])}):",
-                  file=sys.stderr)
-            for d in result['duplicate_nibbles']:
-                print(f"  pos {d['position']}: nibble {d['nibble']:X} "
-                      f"assigned to pair-ids {d['pair_ids']}",
-                      file=sys.stderr)
-        return 0 if result['consistent'] else 1
-
     if args.find_value:
         target = int(args.find_value, 0)
         search_range = None
@@ -1085,13 +917,13 @@ def main(argv=None) -> int:
             search_range = (max(0, idx - rad),
                             min(len(pair_rows), idx + rad + 1))
         cands = find_candidate_words(
-            pair_rows, target, anchors, search_range, nibble_order)
+            pair_rows, target, direct_pins, search_range, nibble_order)
         print(f"\nSearching for codeword(s) consistent with "
               f"value 0x{target:04X}", file=sys.stderr)
         if search_range:
             print(f"  range: codewords [{search_range[0]}, "
                   f"{search_range[1]})", file=sys.stderr)
-        print(f"  using {len(anchors)} existing anchor(s)",
+        print(f"  using {len(direct_pins)} direct bijection pin(s)",
               file=sys.stderr)
         print(f"  found {len(cands)} candidate(s)",
               file=sys.stderr)
@@ -1190,15 +1022,20 @@ def main(argv=None) -> int:
             if len(vec_str) > 60:
                 vec_str = vec_str[:57] + "..."
             print(f"  Vector spec: {vec_str}", file=sys.stderr)
-        print(f"  Base anchors: {len(anchors)}", file=sys.stderr)
+        print(f"  Direct bijection pins: {len(direct_pins)}", file=sys.stderr)
         print(file=sys.stderr)
 
         # Quick consistency check function
         def try_value(value: int) -> dict | None:
-            """Try anchoring cw_idx to value; return scoring info or None on conflict."""
-            test_anchors = list(anchors) + [(cw_idx, value)]
+            """Try assigning cw_idx to value; return scoring info or None on conflict."""
+            test_direct_pins = list(direct_pins)
+            for p in range(4):
+                pid = pair_rows[cw_idx][p]
+                nib = (value >> (12 - 4 * nibble_order[p])) & 0xF
+                test_direct_pins.append((p, pid, nib))
             try:
-                mappings = derive_mappings(pair_rows, test_anchors, nibble_order)
+                mappings = derive_mappings(
+                    pair_rows, nibble_order, direct_pins=test_direct_pins)
             except ValueError:
                 return None  # contradiction
 
@@ -1276,7 +1113,7 @@ def main(argv=None) -> int:
                       file=sys.stderr)
             print(file=sys.stderr)
             print(f"  Try a different cw_idx, expand --search-range, "
-                  f"adjust --search-vectors, or check base anchors.",
+                  f"or adjust --search-vectors.",
                   file=sys.stderr)
 
         return 0
@@ -1332,23 +1169,19 @@ def main(argv=None) -> int:
                       file=sys.stderr)
         return 0
 
-    if not anchors and not direct_pins:
-        print("[!] no anchors supplied; mapping is heuristic only and "
+    if not direct_pins:
+        print("[!] no direct bijection pins supplied; mapping is heuristic only and "
               "almost certainly wrong",
               file=sys.stderr)
 
-    mappings = derive_mappings(pair_rows, anchors, nibble_order,
-                               direct_pins=direct_pins)
+    mappings = derive_mappings(pair_rows, nibble_order, direct_pins=direct_pins)
 
     # Show the derived mappings so the user can sanity-check.
     pinned = [set() for _ in range(4)]
-    for cw, w in anchors:
-        for p in range(4):
-            pinned[p].add(pair_rows[cw][p])
     for pos, pid, _nib in direct_pins:
         pinned[pos].add(pid)
     print("[+] derived pair-id -> nibble mappings "
-          "(P = pinned by anchor, h = heuristic):", file=sys.stderr)
+          "(P = direct pin, h = heuristic):", file=sys.stderr)
     for p in range(4):
         line = f"  pos {p}: "
         for pid in range(16):

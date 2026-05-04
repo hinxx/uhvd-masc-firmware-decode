@@ -2,8 +2,8 @@
 """
 Dump decoded frame metadata alongside decoded payload words.
 
-This is intentionally a diagnostic view.  Payload words use whatever anchors
-you provide (or the decoder's heuristic fallback if you provide none).
+This is intentionally a diagnostic view.  Payload words use the decoder's
+heuristic fallback unless direct bijection pins are supplied elsewhere.
 Metadata can use a direct pair-id -> nibble JSON such as counter_bijection.json.
 """
 
@@ -31,17 +31,6 @@ def parse_nibble_order(text: str) -> tuple[int, int, int, int]:
     if sorted(order) != [0, 1, 2, 3]:
         raise ValueError("nibble order must be a permutation of 0123")
     return order
-
-
-def load_anchors(path: str | None) -> list[tuple[int, int]]:
-    if not path:
-        return []
-    raw = json.loads(Path(path).read_text())
-
-    def to_int(value):
-        return int(value, 0) if isinstance(value, str) else int(value)
-
-    return [(to_int(idx), to_int(word)) for idx, word in raw]
 
 
 def load_direct_mapping(path: str | None) -> list[dict[int, int]]:
@@ -147,8 +136,6 @@ def main() -> int:
                         help="byte offset to start frame scan")
     parser.add_argument("--end", type=lambda s: int(s, 0), default=None,
                         help="byte offset to stop frame scan")
-    parser.add_argument("--anchors",
-                        help="payload anchors JSON; omitted means heuristic payload decode")
     parser.add_argument("--nibble-order", default="0231",
                         help="payload nibble order (default: 0231)")
     parser.add_argument("--metadata-bijection", default="counter_bijection.json",
@@ -170,10 +157,9 @@ def main() -> int:
     payload, frames, _anomalous = strip_framing(
         data, frames, only_standard=args.only_standard)
 
-    anchors = load_anchors(args.anchors)
     payload_order = parse_nibble_order(args.nibble_order)
     payload_rows = decode_pair_indices(payload)
-    payload_mappings = derive_mappings(payload_rows, anchors, payload_order)
+    payload_mappings = derive_mappings(payload_rows, payload_order)
 
     metadata_path = args.metadata_bijection
     metadata_mapping = None
@@ -193,7 +179,7 @@ def main() -> int:
     expected_meta = expected_metadata_values(data, frames)
 
     print(f"input={args.input} frames={len(frames)} payload_words={len(payload_rows)}")
-    print(f"payload anchors={len(anchors)} payload_order={args.nibble_order}")
+    print(f"payload_order={args.nibble_order}")
     print(
         f"metadata_bijection={metadata_path or '(none)'} "
         f"metadata_order={args.metadata_nibble_order}"

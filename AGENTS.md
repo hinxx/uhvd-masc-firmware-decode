@@ -15,10 +15,10 @@ Decoding happens in stages:
 1. `find_frames()` locates frame boundaries and records field offsets.
 2. `strip_framing()` extracts payload bytes and skips non-payload fields.
 3. `decode_pair_indices()` maps each 4-byte codeword to four pair IDs.
-4. `derive_mappings()` turns pair IDs into nibbles using known-word anchors.
+4. `derive_mappings()` turns pair IDs into nibbles using direct bijection pins when available, plus a heuristic fallback.
 5. `apply_mappings()` assembles the four nibbles into 16-bit output words.
 
-The deterministic part is byte-to-pair-ID conversion. The uncertain part is pair-ID-to-nibble assignment: histograms reveal the 16 pair groups, but not which pair means which nibble. Anchors such as known `0xFFFF` erased-flash runs or known vector-table opcodes pin that bijection. Without anchors, the script can still produce output using frequency heuristics, but it warns that the decoded words are probably wrong.
+The deterministic part is byte-to-pair-ID conversion. The uncertain part is pair-ID-to-nibble assignment: histograms reveal the 16 pair groups, but not which pair means which nibble. A direct bijection file can pin that assignment. Without direct pins, the script can still produce output using frequency heuristics, but it warns that the decoded words are probably wrong.
 
 ## line-code alphabets and masks
 
@@ -26,7 +26,7 @@ The deterministic part is byte-to-pair-ID conversion. The uncertain part is pair
 
 `POSITION_MASKS = (0x66, 0x33, 0x99, 0xCC)` gives the XOR partner rule for those same positions. For any legal payload byte `b`, `b ^ POSITION_MASKS[pos]` must also be legal in that position's alphabet. Those two bytes are the same logical symbol with opposite line-code polarity/disparity. `_build_pair_index()` walks each alphabet, verifies that it is closed under the position mask, and collapses the 32 bytes into 16 pair IDs.
 
-The pair ID is deterministic but not yet the final nibble value. For example, if two bytes differ only by the position mask, they get the same pair ID, but deciding whether that pair ID means nibble `0x0`, `0xF`, or any other value is the later anchor-derived mapping step. The numeric pair IDs are implementation labels assigned by sorted alphabet order; they are useful for consistency checks and anchors, not intrinsic DSP nibble values.
+The pair ID is deterministic but not yet the final nibble value. For example, if two bytes differ only by the position mask, they get the same pair ID, but deciding whether that pair ID means nibble `0x0`, `0xF`, or any other value is the later bijection mapping step. The numeric pair IDs are implementation labels assigned by sorted alphabet order; they are useful for consistency checks and direct mapping files, not intrinsic DSP nibble values.
 
 The alphabets were first named for payload decoding, but the sync/header, FFFF marker, and metadata/counter fields also use bytes from the same per-position alphabets. Framing fields are still handled separately from firmware payload: the constant FFFF marker and metadata/counter are stripped before payload decoding, and tag suffix bytes are recognized through `VALID_TAG_SUFFIXES` rather than treated as normal payload.
 
@@ -52,11 +52,11 @@ python3 analyze_frame_headers.py frames.txt
 python3 generate_counter_bijection.py firmware-no-header.elf.e > counter_bijection.json
 ```
 
-The count-up metadata bijection is also the strongest whole-file payload decode candidate found so far. Using `counter_bijection_extrapolated.json` as direct pair-ID pins for the payload decoder, with `--nibble-order 0123` and no `anchors.json`, produces plausible decoded output. The first decoded bytes are ASCII `PROGRAM&DATA`, and later decoded data contains two-letter ASCII host command mnemonics matching the command table in `docs/Host-Command-Reference_920-0002V.pdf`, such as `AC`, `AD`, `AF`, `AG`, `AI`, `AM`, `AO`, `AP`, `AS`, `AT`, `AV`, `BD`, `BE`, `BO`, `BR`, `CC`, `CD`, `CF`, `CG`, `CI`, `CM`, `CS`, `DA`, `DB`, `DE`, `DF`, `DL`, `DM`, `DR`, `ED`, `EF`, `EI`, `ES`, `FI`, `FX`, `GC`, `GD`, `GI`, `GL`, `GP`, `GS`, and `GV`.
+The count-up metadata bijection is also the strongest whole-file payload decode candidate found so far. Using `counter_bijection_extrapolated.json` as direct pair-ID pins for the payload decoder with `--nibble-order 0123` produces plausible decoded output. The first decoded bytes are ASCII `PROGRAM&DATA`, and later decoded data contains two-letter ASCII host command mnemonics matching the command table in `docs/Host-Command-Reference_920-0002V.pdf`, such as `AC`, `AD`, `AF`, `AG`, `AI`, `AM`, `AO`, `AP`, `AS`, `AT`, `AV`, `BD`, `BE`, `BO`, `BR`, `CC`, `CD`, `CF`, `CG`, `CI`, `CM`, `CS`, `DA`, `DB`, `DE`, `DF`, `DL`, `DM`, `DR`, `ED`, `EF`, `EI`, `ES`, `FI`, `FX`, `GC`, `GD`, `GI`, `GL`, `GP`, `GS`, and `GV`.
 
 Important caveat: `counter_bijection.json` contains only observed metadata pins, while `counter_bijection_extrapolated.json` fills the missing pair IDs by pattern extrapolation. The extrapolated file is the one to use for whole-payload decode tests.
 
-The CLI supports investigation as well as decoding. `--info` summarizes frame structure and byte distributions, `--find-runs` finds likely anchor candidates, `--check-anchors` validates anchor consistency, and `--trace-decode` prints one line per 4 input bytes showing field type, raw bytes, byte-to-nibble order, pair IDs, nibbles, decoded word, output bytes, and notes such as frame header, data, metadata, or tag.
+The CLI supports investigation as well as decoding. `--info` summarizes frame structure and byte distributions, `--find-runs` finds constant codeword runs, `--find-value` checks values against direct bijection pins, and `--inspect` prints pair IDs around selected codeword indices.
 
 ## running the script
 
