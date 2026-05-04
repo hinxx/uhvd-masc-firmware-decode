@@ -136,8 +136,8 @@ def main() -> int:
                         help="byte offset to start frame scan")
     parser.add_argument("--end", type=lambda s: int(s, 0), default=None,
                         help="byte offset to stop frame scan")
-    parser.add_argument("--nibble-order", default="0231",
-                        help="payload nibble order (default: 0231)")
+    parser.add_argument("--nibble-order", default="0123",
+                        help="payload nibble order (default: 0123)")
     parser.add_argument("--metadata-bijection", default="counter_bijection.json",
                         help="direct metadata mapping JSON (default: counter_bijection.json)")
     parser.add_argument("--metadata-nibble-order", default="0123",
@@ -216,7 +216,7 @@ def main() -> int:
             f"decoded={meta_value} expected_offset={expected_text} "
             f"pids=({meta_pids}) nibbles=({meta_nibs})"
         )
-        print(f"  marker={frame['ffff_marker'].hex(' ')} tag={tag}")
+        print(f"  marker={frame['frame_marker'].hex(' ')} tag={tag}")
 
         if valid_payload and pbytes:
             frame_rows = decode_pair_indices(pbytes)

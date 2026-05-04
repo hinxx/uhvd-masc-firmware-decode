@@ -5,10 +5,10 @@
 The file is parsed as frames. A normal frame is 168 bytes:
 
 ```text
-[sync 4][FFFF marker 4][metadata 4][payload 152][tag 4]
+[sync 4][frame marker 4][metadata 4][payload 152][tag 4]
 ```
 
-Frame detection uses the constant FFFF marker `9c 66 1b a5` at offset `+4` from a sync byte starting with `0x99`, which is more robust than matching every known sync variant. The decoder strips sync, marker, metadata/counter, and tag, then concatenates only payload codewords. Anomalous frames are recorded and included only when their payload bytes still pass the codeword alphabet check, unless `--only-standard` is used.
+Frame detection uses the constant frame marker `9c 66 1b a5` at offset `+4` from a sync byte starting with `0x99`, which is more robust than matching every known sync variant. With the current direct bijection candidate, this marker codeword decodes to `0x0000`. The decoder strips sync, marker, metadata/counter, and tag, then concatenates only payload codewords. Anomalous frames are recorded and included only when their payload bytes still pass the codeword alphabet check, unless `--only-standard` is used.
 
 Decoding happens in stages:
 
@@ -28,7 +28,7 @@ The deterministic part is byte-to-pair-ID conversion. The uncertain part is pair
 
 The pair ID is deterministic but not yet the final nibble value. For example, if two bytes differ only by the position mask, they get the same pair ID, but deciding whether that pair ID means nibble `0x0`, `0xF`, or any other value is the later bijection mapping step. The numeric pair IDs are implementation labels assigned by sorted alphabet order; they are useful for consistency checks and direct mapping files, not intrinsic DSP nibble values.
 
-The alphabets were first named for payload decoding, but the sync/header, FFFF marker, and metadata/counter fields also use bytes from the same per-position alphabets. Framing fields are still handled separately from firmware payload: the constant FFFF marker and metadata/counter are stripped before payload decoding, and tag suffix bytes are recognized through `VALID_TAG_SUFFIXES` rather than treated as normal payload.
+The alphabets were first named for payload decoding, but the sync/header, frame marker, and metadata/counter fields also use bytes from the same per-position alphabets. Framing fields are still handled separately from firmware payload: the constant frame marker and metadata/counter are stripped before payload decoding, and tag suffix bytes are recognized through `VALID_TAG_SUFFIXES` rather than treated as normal payload.
 
 ## frame-header codewords and counter finding
 

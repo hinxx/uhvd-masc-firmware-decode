@@ -4,10 +4,11 @@ DSP56800E firmware decoder for the 4b/8b line-coded, 168-byte-framed format.
 
 File format (verified from real frame data):
     Stream of frames, each structured as:
-        [sync 4][FFFF-marker 4][metadata 4][payload 152][tag 4] = 168 bytes
+        [sync 4][frame marker 4][metadata 4][payload 152][tag 4] = 168 bytes
     where:
         sync         = one of {99 56 87 68, 99 55 83 68, 99 56 83 68}
-        FFFF-marker  = constant 9c 66 1b a5 (one codeword, decodes to 0xFFFF)
+        frame marker = constant 9c 66 1b a5 (one codeword, decodes to 0x0000
+                       with the current direct bijection candidate)
         metadata     = 4 bytes that are NOT in the codeword alphabet;
                        likely a destination flash address or frame counter
         payload      = 38 codewords = 38 16-bit DSP words = 76 bytes of
@@ -35,7 +36,7 @@ Encoding:
 Decoding pipeline:
     1. find_frames        — locate every sync, parse frame fields.
     2. strip_framing      — concatenate payload bytes (drop sync,
-                            FFFF-marker, metadata, and tag from each).
+                            frame marker, metadata, and tag from each).
     3. decode_pair_indices — bytes → pair-id (0..15) tuples.
     4. derive_mappings    — pair-id → nibble.
     5. apply_mappings     — produce final 16-bit words.
@@ -70,25 +71,15 @@ from typing import Iterable, Sequence
 # ============================================================================
 
 SYNC_LEN = 4
-FFFF_MARKER_LEN = 4    # The constant 4-byte FFFF codeword (9c 66 1b a5)
+FRAME_MARKER_LEN = 4   # The constant 4-byte frame marker (9c 66 1b a5)
 METADATA_LEN = 4       # 4 bytes of frame metadata (not a codeword)
 TAG_LEN = 4
-FRAMING = SYNC_LEN + FFFF_MARKER_LEN + METADATA_LEN + TAG_LEN  # 16 bytes
+FRAMING = SYNC_LEN + FRAME_MARKER_LEN + METADATA_LEN + TAG_LEN  # 16 bytes
 STD_FRAME_SIZE = 168
 STD_PAYLOAD_SIZE = STD_FRAME_SIZE - FRAMING  # 152 bytes = 38 codewords
 
-# The FFFF marker bytes (constant for all frames)
-FFFF_MARKER = b"\x9c\x66\x1b\xa5"
-
-# Sync values observed across the analysed firmware files.  This set is
-# kept for informational purposes only — frame detection now uses the
-# constant FFFF_MARKER at +4 from the sync, which matches every variant.
-VALID_SYNCS = {
-    b"\x99\x56\x87\x68",  # standard / interior
-    b"\x99\x55\x83\x68",  # boundary variant — observed at file start
-    b"\x99\x56\x83\x68",  # boundary variant — observed at file end
-    b"\x99\x56\x83\x1D",  # mid-file variant — observed in custom firmware
-}
+# The frame marker bytes (constant for all frames)
+FRAME_MARKER = b"\x9c\x66\x1b\xa5"
 
 # Bytes 2 and 3 of the tag word are fixed markers (with disparity flip).
 VALID_TAG_SUFFIXES = {(0x26, 0x9F), (0xBF, 0x53)}
@@ -158,13 +149,13 @@ def find_frames(data: bytes,
                 start_offset: int = 0,
                 end_offset: int | None = None,
                 ) -> list[dict]:
-    """Locate every frame in `data` by scanning for the FFFF-marker.
+    """Locate every frame in `data` by scanning for the frame marker.
 
-    Frame structure: [sync 4][FFFF-marker 4][metadata 4][payload N-16][tag 4].
+    Frame structure: [sync 4][frame marker 4][metadata 4][payload N-16][tag 4].
 
     The frame's sync (bytes 0..3) varies — observed values include
     99 55 83 68, 99 56 87 68, 99 56 83 68, and 99 56 83 1D — and likely
-    encode some frame-type flag.  The FFFF-marker, however, is the
+    encode some frame-type flag.  The frame marker, however, is the
     constant 4-byte sequence 9c 66 1b a5 at offset +4 from every sync.
     Detecting frames via the marker is far more robust than enumerating
     every legal sync variant.
@@ -179,31 +170,31 @@ def find_frames(data: bytes,
         Frames in file order.  Each frame's `frame_size` is the
         distance to the next sync (or to `end_offset` for the final
         frame).  Each frame includes pre-computed `payload_start`,
-        `payload_size`, `ffff_marker`, `metadata`, and `tag`.
+        `payload_size`, `frame_marker`, `metadata`, and `tag`.
     """
     if end_offset is None:
         end_offset = len(data)
 
     # A frame begins at byte B where:
     #   data[B] == 0x99
-    #   data[B+4 : B+8] == FFFF_MARKER (= 9c 66 1b a5)
-    # The 0x99 prefix on the sync gives us a quick reject; the FFFF marker
+    #   data[B+4 : B+8] == FRAME_MARKER (= 9c 66 1b a5)
+    # The 0x99 prefix on the sync gives us a quick reject; the frame marker
     # confirms.  This catches every sync variant without enumerating them.
     sync_positions: list[int] = []
     pos = start_offset
-    last_search = end_offset - SYNC_LEN - FFFF_MARKER_LEN + 1
+    last_search = end_offset - SYNC_LEN - FRAME_MARKER_LEN + 1
     while pos < last_search:
         if (data[pos] == 0x99 and
                 bytes(data[pos + SYNC_LEN
-                            :pos + SYNC_LEN + FFFF_MARKER_LEN]) == FFFF_MARKER):
+                            :pos + SYNC_LEN + FRAME_MARKER_LEN]) == FRAME_MARKER):
             sync_positions.append(pos)
-            pos += SYNC_LEN + FFFF_MARKER_LEN
+            pos += SYNC_LEN + FRAME_MARKER_LEN
             continue
         pos += 1
 
     if not sync_positions:
         raise ValueError(
-            "no frames found; expected the constant FFFF marker "
+            "no frames found; expected the constant frame marker "
             "9c 66 1b a5 at offset +4 from each sync, with sync byte 0 = 0x99")
 
     frames = []
@@ -213,23 +204,24 @@ def find_frames(data: bytes,
         size = end - start
         sync = bytes(data[start:start + SYNC_LEN])
         # New layout (verified from real frame data):
-        #   [sync 4][FFFF-marker 4][metadata 4][payload N-16][tag 4]
-        # The FFFF-marker is the constant 4-byte sequence 9c 66 1b a5 (= one
-        # codeword whose pair-ids decode to 0xFFFF).  The metadata is 4 bytes
+        #   [sync 4][frame marker 4][metadata 4][payload N-16][tag 4]
+        # The frame marker is the constant 4-byte sequence 9c 66 1b a5 (= one
+        # codeword whose pair-ids decode to 0x0000 with the current direct
+        # bijection candidate).  The metadata is 4 bytes
         # NOT in the codeword alphabet — likely the destination flash address
         # or a frame counter.  Tag occupies the last 4 bytes of the frame.
-        if size >= SYNC_LEN + FFFF_MARKER_LEN + METADATA_LEN + TAG_LEN:
-            ffff_marker = bytes(data[start + SYNC_LEN
-                                     :start + SYNC_LEN + FFFF_MARKER_LEN])
-            metadata = bytes(data[start + SYNC_LEN + FFFF_MARKER_LEN
-                                  :start + SYNC_LEN + FFFF_MARKER_LEN + METADATA_LEN])
-            payload_start = start + SYNC_LEN + FFFF_MARKER_LEN + METADATA_LEN
-            payload_size = size - (SYNC_LEN + FFFF_MARKER_LEN + METADATA_LEN
+        if size >= SYNC_LEN + FRAME_MARKER_LEN + METADATA_LEN + TAG_LEN:
+            frame_marker = bytes(data[start + SYNC_LEN
+                                      :start + SYNC_LEN + FRAME_MARKER_LEN])
+            metadata = bytes(data[start + SYNC_LEN + FRAME_MARKER_LEN
+                                  :start + SYNC_LEN + FRAME_MARKER_LEN + METADATA_LEN])
+            payload_start = start + SYNC_LEN + FRAME_MARKER_LEN + METADATA_LEN
+            payload_size = size - (SYNC_LEN + FRAME_MARKER_LEN + METADATA_LEN
                                    + TAG_LEN)
             tag = bytes(data[end - TAG_LEN:end])
         else:
             # Frame too short for the full structure; treat conservatively.
-            ffff_marker = b""
+            frame_marker = b""
             metadata = b""
             payload_start = start + SYNC_LEN
             payload_size = max(0, size - SYNC_LEN)
@@ -240,7 +232,7 @@ def find_frames(data: bytes,
             "end": end,
             "frame_size": size,
             "sync": sync,
-            "ffff_marker": ffff_marker,
+            "frame_marker": frame_marker,
             "metadata": metadata,
             "tag": tag,
             "payload_start": payload_start,
@@ -273,8 +265,8 @@ def strip_framing(data: bytes,
             to drop from the start of each STANDARD frame's payload.
             This is useful when each frame begins with a fixed number
             of padding/header codewords that are not part of the
-            decoded program memory image.  For this format, set to 8
-            to drop the 2 leading 0xFFFF padding words per frame.
+            decoded program memory image.  The frame marker is already
+            stripped separately and should not be handled with this option.
             Anomalous frames are passed through verbatim regardless.
 
     Returns:
@@ -704,13 +696,13 @@ def _info(data: bytes,
         print(f"  WARNING: {bad_tag} frame(s) with unexpected tag marker — "
               f"frame boundaries may be wrong", file=sys.stderr)
 
-    # FFFF-marker validation
-    ffff_ok = sum(1 for f in frames if f.get("ffff_marker") == FFFF_MARKER)
-    ffff_other = len(frames) - ffff_ok
-    print(f"FFFF-marker (bytes 4-7 of frame): {ffff_ok}/{len(frames)} match "
+    # Frame marker validation
+    marker_ok = sum(1 for f in frames if f.get("frame_marker") == FRAME_MARKER)
+    marker_other = len(frames) - marker_ok
+    print(f"frame marker (bytes 4-7 of frame): {marker_ok}/{len(frames)} match "
           f"the constant 9c 66 1b a5", file=sys.stderr)
-    if ffff_other:
-        print(f"  {ffff_other} frame(s) had a different value — investigate",
+    if marker_other:
+        print(f"  {marker_other} frame(s) had a different value — investigate",
               file=sys.stderr)
 
     # Sample of metadata fields (first 5 standard frames)
@@ -802,7 +794,8 @@ def main(argv=None) -> int:
                          "for testing whether "
                          "an externally-derived bijection (e.g. from metadata "
                          "counter analysis) is also valid for payload decoding.")
-    ap.add_argument("--search-anchor", metavar="CW_IDX",
+    ap.add_argument("--search-cw-value", metavar="CW_IDX",
+                    dest="search_cw_value",
                     type=lambda s: int(s, 0), default=None,
                     help="search for a value at codeword CW_IDX such that "
                          "the resulting decode of the vector table is "
@@ -810,14 +803,14 @@ def main(argv=None) -> int:
                          "or in upper memory). Tries values 0x0000-0xFFFF "
                          "and reports candidates by structural score.")
     ap.add_argument("--search-range", metavar="LO:HI", default="0:0x10000",
-                    help="value range for --search-anchor (default 0:0x10000)")
+                    help="value range for --search-cw-value (default 0:0x10000)")
     ap.add_argument("--vector-table-end", metavar="ADDR",
                     type=lambda s: int(s, 0), default=0xA4,
                     help="chip address where the vector table ends (default "
-                         "0xA4 = 82 vectors × 2 words). Used by --search-anchor "
+                         "0xA4 = 82 vectors × 2 words). Used by --search-cw-value "
                          "to validate handler targets.")
     ap.add_argument("--search-vectors", metavar="SPEC", default="all",
-                    help="restrict --search-anchor's structural-validity check "
+                    help="restrict --search-cw-value's structural-validity check "
                          "to these vector indices. Use comma-separated indices "
                          "and ranges, e.g. '2,4,5,6..19,22..77,79..81' to "
                          "include vectors expected to point at low addresses "
@@ -941,15 +934,15 @@ def main(argv=None) -> int:
                       file=sys.stderr)
         return 0
 
-    if args.search_anchor is not None:
-        cw_idx = args.search_anchor
+    if args.search_cw_value is not None:
+        cw_idx = args.search_cw_value
         lo_str, hi_str = args.search_range.split(":")
         val_lo = int(lo_str, 0)
         val_hi = int(hi_str, 0)
         vt_end = args.vector_table_end
 
         if cw_idx >= len(pair_rows):
-            print(f"--search-anchor: codeword index {cw_idx} out of range "
+            print(f"--search-cw-value: codeword index {cw_idx} out of range "
                   f"(have {len(pair_rows)} codewords)", file=sys.stderr)
             return 2
 

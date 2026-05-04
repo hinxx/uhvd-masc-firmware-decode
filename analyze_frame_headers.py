@@ -4,14 +4,14 @@ Analyze encoded frame headers captured in frames.txt.
 
 The script treats each 12-byte record as:
 
-    [sync 4][FFFF marker 4][metadata/address 4]
+    [sync 4][frame marker 4][metadata/address 4]
 
 and reuses the POSITION_PAYLOAD_ALPHABETS / POSITION_MASKS pair-ID logic from
 dsp56800e_decoder.py.  It is meant for testing theories about:
 
 * whether sync bytes 3..4 encode a frame length/count value;
 * whether metadata bytes 9..12 encode a monotonic address/counter;
-* whether those theories are consistent with the current FFFF marker anchor.
+* whether those theories are consistent with the current frame marker pin.
 """
 
 from __future__ import annotations
@@ -246,7 +246,7 @@ def print_header_summary(rows: list[HeaderRow]) -> None:
         print("  note: first metadata is the same logical codeword as the marker")
 
 
-def analyze_sync_lengths(rows: list[HeaderRow], include_marker_anchor: bool) -> None:
+def analyze_sync_lengths(rows: list[HeaderRow], include_frame_marker_pin: bool) -> None:
     print("\nSync bytes 3..4 length/count hypotheses")
     names = [
         "encoded_frame_size",
@@ -256,8 +256,9 @@ def analyze_sync_lengths(rows: list[HeaderRow], include_marker_anchor: bool) -> 
         "payload_words",
     ]
     base = []
-    if include_marker_anchor and rows:
-        base = word_constraints("marker=0xffff", rows[0].marker, 0xFFFF, (0, 1, 2, 3))
+    if include_frame_marker_pin and rows:
+        base = word_constraints("frame_marker=0x0000", rows[0].marker, 0x0000,
+                                (0, 1, 2, 3))
 
     for name in names:
         constraints = list(base)
@@ -360,7 +361,7 @@ def total_counter_start(rows: list[HeaderRow],
 
 
 def analyze_metadata_counter(rows: list[HeaderRow],
-                             include_marker_anchor: bool,
+                             include_frame_marker_pin: bool,
                              nibble_order: tuple[int, int, int, int],
                              show_best: int,
                              include_unknown_size_rows: bool,
@@ -373,8 +374,9 @@ def analyze_metadata_counter(rows: list[HeaderRow],
     if skipped:
         print(f"  skipped {skipped} row(s) without a known size")
     base = []
-    if include_marker_anchor and model_rows:
-        base = word_constraints("marker=0xffff", model_rows[0].marker, 0xFFFF, nibble_order)
+    if include_frame_marker_pin and model_rows:
+        base = word_constraints("frame_marker=0x0000", model_rows[0].marker,
+                                0x0000, nibble_order)
 
     step_names = [
         "frame_index",
@@ -447,7 +449,7 @@ def emit_constraints_json(rows: list[HeaderRow],
                           step_name: str,
                           data_only: bool,
                           down_from_ffff: bool,
-                          include_marker_anchor: bool,
+                          include_frame_marker_pin: bool,
                           nibble_order: tuple[int, int, int, int],
                           include_unknown_size_rows: bool,
                           start_payload_size: bool,
@@ -464,8 +466,10 @@ def emit_constraints_json(rows: list[HeaderRow],
             data_only=data_only,
         )
     constraints = []
-    if include_marker_anchor and model_rows:
-        constraints.extend(word_constraints("marker=0xffff", model_rows[0].marker, 0xFFFF, nibble_order))
+    if include_frame_marker_pin and model_rows:
+        constraints.extend(word_constraints("frame_marker=0x0000",
+                                            model_rows[0].marker, 0x0000,
+                                            nibble_order))
     for row, value in expected_counter_values(
         model_rows,
         step_name,
@@ -521,8 +525,9 @@ def main() -> int:
                         help="optional original binary, used only to size the last frame")
     parser.add_argument("--nibble-order", default="0123",
                         help="metadata nibble order for 16-bit counter tests")
-    parser.add_argument("--no-marker-anchor", action="store_true",
-                        help="do not require the 9c 66 1b a5 marker to mean 0xffff")
+    parser.add_argument("--no-frame-marker-pin", action="store_true",
+                        help="do not require the 9c 66 1b a5 frame marker "
+                             "to mean 0x0000")
     parser.add_argument("--show-best", type=int, default=8,
                         help="number of counter models to print (default: 8)")
     parser.add_argument("--emit-counter-constraints", action="store_true",
@@ -555,7 +560,7 @@ def main() -> int:
     binary_size = Path(args.binary).stat().st_size if args.binary else None
     rows = parse_frames_txt(Path(args.frames), binary_size=binary_size)
     nibble_order = parse_nibble_order(args.nibble_order)
-    include_marker_anchor = not args.no_marker_anchor
+    include_frame_marker_pin = not args.no_frame_marker_pin
 
     if args.emit_counter_constraints:
         emit_constraints_json(
@@ -563,7 +568,7 @@ def main() -> int:
             args.counter_step,
             data_only=not args.counter_all_frames,
             down_from_ffff=not args.counter_up,
-            include_marker_anchor=include_marker_anchor,
+            include_frame_marker_pin=include_frame_marker_pin,
             nibble_order=nibble_order,
             include_unknown_size_rows=args.include_unknown_counter_rows,
             start_payload_size=args.counter_start_payload_size,
@@ -572,10 +577,10 @@ def main() -> int:
         return 0
 
     print_header_summary(rows)
-    analyze_sync_lengths(rows, include_marker_anchor=include_marker_anchor)
+    analyze_sync_lengths(rows, include_frame_marker_pin=include_frame_marker_pin)
     analyze_metadata_counter(
         rows,
-        include_marker_anchor=include_marker_anchor,
+        include_frame_marker_pin=include_frame_marker_pin,
         nibble_order=nibble_order,
         show_best=args.show_best,
         include_unknown_size_rows=args.include_unknown_counter_rows,
