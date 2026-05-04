@@ -371,6 +371,7 @@ def derive_mappings(pair_rows: Sequence[tuple[int, int, int, int]],
                     anchors: Iterable[tuple[int, int]] = (),
                     nibble_order: tuple[int, int, int, int] = (0, 1, 2, 3),
                     rank: Sequence[int] = DEFAULT_NIBBLE_RANK,
+                    direct_pins: Iterable[tuple[int, int, int]] = (),
                     ) -> tuple[dict, dict, dict, dict]:
     """Derive per-position pair-id → nibble mappings from anchors.
 
@@ -384,6 +385,9 @@ def derive_mappings(pair_rows: Sequence[tuple[int, int, int, int]],
             pos 1 → 11:8, pos 2 → 7:4, pos 3 → 3:0  (big-endian within
             the word).  Use (3,2,1,0) for little-endian.
         rank: tie-break order for nibbles not pinned by any anchor.
+        direct_pins: iterable of (pos, pair_id, nibble) tuples, applied
+            as direct bijection pins (no codeword involved). Useful for
+            externally-derived bijection constraints.
 
     Returns:
         Tuple of 4 dicts (one per byte position), each mapping
@@ -394,6 +398,20 @@ def derive_mappings(pair_rows: Sequence[tuple[int, int, int, int]],
     """
     n = len(pair_rows)
     cands = [{pid: set(range(16)) for pid in range(16)} for _ in range(4)]
+
+    # Apply direct pins first.
+    for pos, pid, nib in direct_pins:
+        if not (0 <= pos < 4):
+            raise ValueError(f"direct pin pos {pos} out of range 0..3")
+        if not (0 <= pid < 16):
+            raise ValueError(f"direct pin pair_id {pid} out of range 0..15")
+        if not (0 <= nib < 16):
+            raise ValueError(f"direct pin nibble {nib} out of range 0..15")
+        if nib not in cands[pos][pid]:
+            raise ValueError(
+                f"direct pin (pos={pos}, pid={pid}, nib={nib}) contradicts "
+                f"existing constraints")
+        cands[pos][pid] = {nib}
 
     # Apply anchors.
     for cw, expected in anchors:
@@ -523,50 +541,6 @@ def inspect_codewords(pair_rows: Sequence[tuple[int, int, int, int]],
     return out
 
 
-def parse_int_ranges(spec: str,
-                     *,
-                     min_value: int | None = None,
-                     max_value: int | None = None,
-                     ) -> list[int]:
-    """Parse comma-separated integers and inclusive ranges.
-
-    Examples:
-        "2,5,8-10" -> [2, 5, 8, 9, 10]
-        "0x10-0x12" -> [16, 17, 18]
-    """
-    values = []
-    seen = set()
-    for raw_token in spec.split(","):
-        token = raw_token.strip()
-        if not token:
-            continue
-
-        if "-" in token[1:]:
-            sep = token.find("-", 1)
-            lo = int(token[:sep], 0)
-            hi = int(token[sep + 1:], 0)
-            if hi < lo:
-                raise ValueError(f"invalid descending range {token!r}")
-            candidates = range(lo, hi + 1)
-        else:
-            candidates = [int(token, 0)]
-
-        for value in candidates:
-            if min_value is not None and value < min_value:
-                raise ValueError(
-                    f"value {value} below minimum {min_value}")
-            if max_value is not None and value > max_value:
-                raise ValueError(
-                    f"value {value} above maximum {max_value}")
-            if value not in seen:
-                seen.add(value)
-                values.append(value)
-
-    if not values:
-        raise ValueError("range spec did not contain any values")
-    return values
-
-
 def find_candidate_words(pair_rows: Sequence[tuple[int, int, int, int]],
                          target: int,
                          existing_anchors: Iterable[tuple[int, int]] = (),
@@ -640,20 +614,44 @@ def find_candidate_words(pair_rows: Sequence[tuple[int, int, int, int]],
 def add_anchor_consistency_check(pair_rows: Sequence[tuple[int, int, int, int]],
                                  anchors: Iterable[tuple[int, int]],
                                  nibble_order: tuple[int, int, int, int] = (0, 1, 2, 3),
+                                 direct_pins: Iterable[tuple[int, int, int]] = (),
                                  ) -> dict:
     """Validate a set of candidate anchors for mutual consistency.
+
+    Args:
+        pair_rows: codeword pair-ids.
+        anchors: codeword-based anchors as (cw_idx, expected_word).
+        nibble_order: nibble ordering convention.
+        direct_pins: optional direct (pos, pid, nibble) pins to combine.
 
     Returns:
         {
             "consistent": bool,
-            "contradictions": list of (anchor_a, anchor_b, position, nibble_a, nibble_b),
-            "pinned_per_position": list of int (how many pair-ids each pos pins),
+            "contradictions": list of conflict descriptions,
+            "pinned_per_position": list of int (pair-ids pinned per pos),
             "duplicate_nibbles": list of (position, nibble, [pair_ids])
                 — same nibble assigned to multiple pair-ids,
         }
     """
     pinned = [{} for _ in range(4)]
     contradictions = []
+
+    # Apply direct pins first.
+    for pos, pid, nb in direct_pins:
+        if pid in pinned[pos]:
+            prev_nb, prev_src = pinned[pos][pid]
+            if prev_nb != nb:
+                contradictions.append({
+                    "position": pos,
+                    "pair_id": pid,
+                    "nibble_a": prev_nb,
+                    "nibble_b": nb,
+                    "source_a": prev_src,
+                    "source_b": "direct_pin",
+                })
+        else:
+            pinned[pos][pid] = (nb, "direct_pin")
+
     anchors = list(anchors)
     for ai, (cw_idx, w) in enumerate(anchors):
         for p in range(4):
@@ -661,10 +659,14 @@ def add_anchor_consistency_check(pair_rows: Sequence[tuple[int, int, int, int]],
             nb = (w >> shift) & 0xF
             pid = pair_rows[cw_idx][p]
             if pid in pinned[p]:
-                prev_nb, prev_ai = pinned[p][pid]
+                prev_nb, prev_src = pinned[p][pid]
                 if prev_nb != nb:
+                    if isinstance(prev_src, int):
+                        anc_a = (anchors[prev_src], prev_src)
+                    else:
+                        anc_a = prev_src  # "direct_pin" string
                     contradictions.append({
-                        "anchor_a": (anchors[prev_ai], prev_ai),
+                        "anchor_a": anc_a,
                         "anchor_b": (anchors[ai], ai),
                         "position": p,
                         "nibble_a": prev_nb,
@@ -908,6 +910,15 @@ def main(argv=None) -> int:
     ap.add_argument("--check-anchors", action="store_true",
                     help="validate the anchors in --anchors for mutual "
                          "consistency and report nibble coverage")
+    ap.add_argument("--bijection-json", metavar="PATH",
+                    help="JSON file with explicit pair-id -> nibble bijection "
+                         "constraints, in the format produced by "
+                         "analyze_frame_headers.py --emit-counter-constraints. "
+                         "Format: {'pinned': [{pos0_map}, {pos1_map}, ...]}. "
+                         "These are added on top of any --anchors as direct "
+                         "(pos, pid, nibble) pins. Useful for testing whether "
+                         "an externally-derived bijection (e.g. from metadata "
+                         "counter analysis) is also valid for payload decoding.")
     ap.add_argument("--search-anchor", metavar="CW_IDX",
                     type=lambda s: int(s, 0), default=None,
                     help="search for a value at codeword CW_IDX such that "
@@ -918,15 +929,24 @@ def main(argv=None) -> int:
                          "0xFFFF and reports candidates by structural score.")
     ap.add_argument("--search-range", metavar="LO:HI", default="0:0x10000",
                     help="value range for --search-anchor (default 0:0x10000)")
-    ap.add_argument("--search-vectors", metavar="SPEC", default="0-81",
-                    help="vector numbers to validate during --search-anchor. "
-                         "SPEC is comma-separated integers/ranges, e.g. "
-                         "'2-19,22-77,79-81'. Default: all vectors 0-81.")
     ap.add_argument("--vector-table-end", metavar="ADDR",
                     type=lambda s: int(s, 0), default=0xA4,
                     help="chip address where the vector table ends (default "
                          "0xA4 = 82 vectors × 2 words). Used by --search-anchor "
                          "to validate handler targets.")
+    ap.add_argument("--search-vectors", metavar="SPEC", default="all",
+                    help="restrict --search-anchor's structural-validity check "
+                         "to these vector indices. Use comma-separated indices "
+                         "and ranges, e.g. '2,4,5,6..19,22..77,79..81' to "
+                         "include vectors expected to point at low addresses "
+                         "(omitting 0,1,20,21,78 if those may legitimately be "
+                         "in upper memory). Default 'all' = check all 82 vectors.")
+    ap.add_argument("--search-target-low-only", action="store_true",
+                    help="when checking --search-vectors, require their targets "
+                         "to be < 0x8000 (low memory only), in addition to being "
+                         ">= --vector-table-end. Use this to enforce that "
+                         "selected vectors must be in low program flash, not "
+                         "upper memory.")
     ap.add_argument("--only-standard", action="store_true",
                     help="exclude anomalous frames from decode")
     args = ap.parse_args(argv)
@@ -1004,10 +1024,29 @@ def main(argv=None) -> int:
         anchors = [(_to_int(idx), _to_int(word)) for idx, word in raw]
         print(f"[+] {len(anchors)} anchor(s) loaded", file=sys.stderr)
 
+    # Load direct bijection pins from JSON (e.g. counter constraints).
+    direct_pins: list[tuple[int, int, int]] = []
+    if args.bijection_json:
+        raw = json.loads(Path(args.bijection_json).read_text())
+        if "pinned" not in raw:
+            print(f"[-] --bijection-json: expected 'pinned' key, got "
+                  f"{list(raw.keys())}", file=sys.stderr)
+            return 2
+        for pos, pid_map in enumerate(raw["pinned"]):
+            for pid_str, nib_str in pid_map.items():
+                pid = int(pid_str, 16) if isinstance(pid_str, str) else int(pid_str)
+                nib = int(nib_str, 16) if isinstance(nib_str, str) else int(nib_str)
+                direct_pins.append((pos, pid, nib))
+        print(f"[+] {len(direct_pins)} direct bijection pin(s) loaded",
+              file=sys.stderr)
+
     if args.check_anchors:
-        result = add_anchor_consistency_check(pair_rows, anchors, nibble_order)
+        result = add_anchor_consistency_check(pair_rows, anchors, nibble_order,
+                                              direct_pins=direct_pins)
         print(f"\nAnchor consistency check:", file=sys.stderr)
         print(f"  Total anchors    : {len(anchors)}", file=sys.stderr)
+        if direct_pins:
+            print(f"  Direct pins      : {len(direct_pins)}", file=sys.stderr)
         print(f"  Consistent       : {result['consistent']}",
               file=sys.stderr)
         print(f"  Pinned per position (out of 16):",
@@ -1085,34 +1124,72 @@ def main(argv=None) -> int:
         # Vector table layout: starts at codeword 6 (after 6-codeword boundary).
         # Each vector = 2 codewords (opcode + target). 82 vectors total.
         # Vector N target codeword = 6 + N*2 + 1.
-        try:
-            search_vectors = parse_int_ranges(
-                args.search_vectors, min_value=0, max_value=81)
-        except ValueError as e:
-            print(f"--search-vectors: {e}", file=sys.stderr)
-            return 2
-        vec_target_cws = [(n, 6 + n * 2 + 1) for n in search_vectors]
+        vec_target_cws = [6 + n * 2 + 1 for n in range(82)]
+
+        # Parse --search-vectors: which vector indices to require structurally valid.
+        # Default 'all' = all 82 vectors.
+        # Otherwise comma-separated list of integers and 'A..B' ranges.
+        if args.search_vectors == "all":
+            check_vecs = list(range(82))
+        else:
+            check_vecs = []
+            for tok in args.search_vectors.split(","):
+                tok = tok.strip()
+                if ".." in tok:
+                    a_str, b_str = tok.split("..", 1)
+                    a = int(a_str.strip(), 0)
+                    b = int(b_str.strip(), 0)
+                    check_vecs.extend(range(a, b + 1))
+                else:
+                    check_vecs.append(int(tok, 0))
+            # Dedupe and validate
+            check_vecs = sorted(set(check_vecs))
+            for v in check_vecs:
+                if not (0 <= v < 82):
+                    print(f"--search-vectors: vector index {v} out of range "
+                          f"(must be 0..81)", file=sys.stderr)
+                    return 2
+
+        check_vecs_set = set(check_vecs)
+        low_only = args.search_target_low_only
 
         # JSR <ABS19> opcode template = 0xE254. Targets that come after JSR (vec 2-81)
         # are 16-bit addresses for in-program-flash targets. JMP targets (vec 0,1)
         # similarly. All vector targets should be valid addresses on the chip.
 
-        def is_valid_target(value: int) -> bool:
+        def is_valid_target(vec_idx: int, value: int) -> bool:
             """A vector target is structurally valid if it's:
             - >= vector_table_end (post-vector-table program flash), OR
-            - >= 0x8000 (upper memory: data flash, boot flash, etc.)
+            - >= 0x8000 (upper memory: data flash, boot flash, etc.) UNLESS
+              --search-target-low-only is set for selected vectors.
+            Vectors NOT in check_vecs are automatically considered valid
+            (their addresses aren't constrained by the search).
             """
-            return value >= vt_end or value >= 0x8000
+            if vec_idx not in check_vecs_set:
+                return True  # not part of the constraint set
+            if value < vt_end:
+                return False  # inside vector table
+            if low_only and value >= 0x8000:
+                return False  # selected vector required to be in low memory
+            return True
 
         print(f"\nSearching for cw {cw_idx} value such that decoded vector "
               f"targets are structurally valid:", file=sys.stderr)
         print(f"  Considering values 0x{val_lo:04X} .. 0x{val_hi:04X}",
               file=sys.stderr)
         print(f"  Vector table end address: 0x{vt_end:04X}", file=sys.stderr)
-        print(f"  Search vectors: {args.search_vectors} "
-              f"({len(search_vectors)} selected)", file=sys.stderr)
-        print(f"  Valid target: addr >= 0x{vt_end:04X} OR addr >= 0x8000",
-              file=sys.stderr)
+        if low_only:
+            print(f"  Validating vectors {len(check_vecs)} (LOW-ONLY: must be "
+                  f"0x{vt_end:04X} <= addr < 0x8000)", file=sys.stderr)
+        else:
+            print(f"  Validating vectors {len(check_vecs)} "
+                  f"(addr >= 0x{vt_end:04X} OR >= 0x8000)", file=sys.stderr)
+        if args.search_vectors != "all":
+            # Print the selected vector indices, abbreviated
+            vec_str = args.search_vectors
+            if len(vec_str) > 60:
+                vec_str = vec_str[:57] + "..."
+            print(f"  Vector spec: {vec_str}", file=sys.stderr)
         print(f"  Base anchors: {len(anchors)}", file=sys.stderr)
         print(file=sys.stderr)
 
@@ -1125,9 +1202,9 @@ def main(argv=None) -> int:
             except ValueError:
                 return None  # contradiction
 
-            # Decode selected vector targets.
+            # Decode all 82 vector targets
             targets = []
-            for vec_num, vt_cw in vec_target_cws:
+            for vt_cw in vec_target_cws:
                 if vt_cw >= len(pair_rows):
                     return None
                 pids = pair_rows[vt_cw]
@@ -1136,15 +1213,16 @@ def main(argv=None) -> int:
                 for p in range(4):
                     nib = mappings[p][pids[p]]
                     v |= nib << (12 - 4 * nibble_order[p])
-                targets.append((vec_num, v))
+                targets.append(v)
 
-            # Score: number of valid targets
-            n_valid = sum(1 for _, t in targets if is_valid_target(t))
+            # Score: number of valid targets among CHECKED vectors only
+            n_valid = sum(1 for vec_idx in check_vecs
+                          if is_valid_target(vec_idx, targets[vec_idx]))
             return {
                 "value": value,
                 "targets": targets,
                 "n_valid": n_valid,
-                "n_total": len(targets),
+                "n_total": len(check_vecs),
             }
 
         # Search
@@ -1162,51 +1240,44 @@ def main(argv=None) -> int:
         print(f"  Tested {n_tested} values, {n_consistent} mathematically consistent",
               file=sys.stderr)
 
-        # Filter: only show results where ALL selected targets are valid
+        # Filter: only show results where ALL 82 targets are valid
         perfect = [r for r in results if r["n_valid"] == r["n_total"]]
         # Sort by valid count descending
         results.sort(key=lambda r: -r["n_valid"])
 
-        def print_vector_targets(targets: Sequence[tuple[int, int]]) -> None:
-            items = [f"vec {vec_num}=0x{addr:04X}"
-                     for vec_num, addr in targets]
-            for i in range(0, len(items), 8):
-                print(f"      {'  '.join(items[i:i + 8])}",
-                      file=sys.stderr)
-
         if perfect:
             print(f"\n  *** {len(perfect)} value(s) give ALL "
-                  f"{len(search_vectors)} selected vectors valid! ***",
+                  f"{len(check_vecs)} checked vectors valid! ***",
                   file=sys.stderr)
             from collections import Counter
             for r in perfect[:30]:
-                tc = Counter(t for _, t in r["targets"])
+                tc = Counter(r["targets"])
                 default, n_default = tc.most_common(1)[0]
                 specifics = sorted(t for t, n in tc.items() if n < n_default)
                 spec_str = ", ".join(f"0x{t:04X}" for t in specifics)
                 print(f"    cw {cw_idx} = 0x{r['value']:04X}: "
                       f"default=0x{default:04X} ({n_default}×), "
                       f"specifics=[{spec_str}]", file=sys.stderr)
-                print_vector_targets(r["targets"])
         else:
-            print(f"\n  No value gives all {len(search_vectors)} selected "
-                  f"vectors valid. Top 10 by score:", file=sys.stderr)
+            print(f"\n  No value gives all {len(check_vecs)} checked vectors "
+                  f"valid. Top 10 by score:", file=sys.stderr)
             from collections import Counter
             for r in results[:10]:
-                tc = Counter(t for _, t in r["targets"])
+                tc = Counter(r["targets"])
                 default, n_default = tc.most_common(1)[0]
-                # Find which targets are INVALID (inside vector table)
-                invalid = sorted({t for _, t in r["targets"]
-                                  if not (t >= vt_end or t >= 0x8000)})
+                # Find which CHECKED vectors are invalid
+                invalid = sorted({r["targets"][vec_idx] for vec_idx in check_vecs
+                                  if not is_valid_target(vec_idx,
+                                                          r["targets"][vec_idx])})
                 inv_str = ", ".join(f"0x{t:04X}" for t in invalid)
                 print(f"    cw {cw_idx} = 0x{r['value']:04X}: "
                       f"{r['n_valid']}/{r['n_total']} valid, "
                       f"default=0x{default:04X}, invalid=[{inv_str}]",
                       file=sys.stderr)
-                print_vector_targets(r["targets"])
             print(file=sys.stderr)
-            print(f"  Try a different cw_idx, expand --search-range, or "
-                  f"check if base anchors are correct.", file=sys.stderr)
+            print(f"  Try a different cw_idx, expand --search-range, "
+                  f"adjust --search-vectors, or check base anchors.",
+                  file=sys.stderr)
 
         return 0
 
@@ -1261,18 +1332,21 @@ def main(argv=None) -> int:
                       file=sys.stderr)
         return 0
 
-    if not anchors:
+    if not anchors and not direct_pins:
         print("[!] no anchors supplied; mapping is heuristic only and "
               "almost certainly wrong",
               file=sys.stderr)
 
-    mappings = derive_mappings(pair_rows, anchors, nibble_order)
+    mappings = derive_mappings(pair_rows, anchors, nibble_order,
+                               direct_pins=direct_pins)
 
     # Show the derived mappings so the user can sanity-check.
     pinned = [set() for _ in range(4)]
     for cw, w in anchors:
         for p in range(4):
             pinned[p].add(pair_rows[cw][p])
+    for pos, pid, _nib in direct_pins:
+        pinned[pos].add(pid)
     print("[+] derived pair-id -> nibble mappings "
           "(P = pinned by anchor, h = heuristic):", file=sys.stderr)
     for p in range(4):

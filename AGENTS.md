@@ -1,4 +1,4 @@
-# DSP56800E Decoder Summary
+# UHVD MASC firmware decoder
 
 `dsp56800e_decoder.py` decodes a framed firmware format that stores DSP56800E 16-bit words as 4-byte line-code codewords. The core idea is that each encoded byte position has its own restricted alphabet, and every alphabet is arranged as 16 XOR-pairs. Each pair represents one logical nibble; the choice between the two bytes in a pair is treated as line-code polarity/disparity, not payload data.
 
@@ -52,9 +52,9 @@ python3 analyze_frame_headers.py frames.txt
 python3 generate_counter_bijection.py firmware-no-header.elf.e > counter_bijection.json
 ```
 
-The count-up metadata bijection is also the strongest whole-file payload decode candidate found so far. Using `counter_bijection_extrapolated.json` as direct pair-ID pins for the payload decoder, with `--nibble-order 0123` and no `anchors.json`, produces plausible decoded output. The first decoded bytes are ASCII `PROGRAM&DATAT`, and later decoded data contains two-letter ASCII host command mnemonics matching the command table in `docs/Host-Command-Reference_920-0002V.pdf`, such as `AC`, `AD`, `AF`, `AG`, `AI`, `AM`, `AO`, `AP`, `AS`, `AT`, `AV`, `BD`, `BE`, `BO`, `BR`, `CC`, `CD`, `CF`, `CG`, `CI`, `CM`, `CS`, `DA`, `DB`, `DE`, `DF`, `DL`, `DM`, `DR`, `ED`, `EF`, `EI`, `ES`, `FI`, `FX`, `GC`, `GD`, `GI`, `GL`, `GP`, `GS`, and `GV`.
+The count-up metadata bijection is also the strongest whole-file payload decode candidate found so far. Using `counter_bijection_extrapolated.json` as direct pair-ID pins for the payload decoder, with `--nibble-order 0123` and no `anchors.json`, produces plausible decoded output. The first decoded bytes are ASCII `PROGRAM&DATA`, and later decoded data contains two-letter ASCII host command mnemonics matching the command table in `docs/Host-Command-Reference_920-0002V.pdf`, such as `AC`, `AD`, `AF`, `AG`, `AI`, `AM`, `AO`, `AP`, `AS`, `AT`, `AV`, `BD`, `BE`, `BO`, `BR`, `CC`, `CD`, `CF`, `CG`, `CI`, `CM`, `CS`, `DA`, `DB`, `DE`, `DF`, `DL`, `DM`, `DR`, `ED`, `EF`, `EI`, `ES`, `FI`, `FX`, `GC`, `GD`, `GI`, `GL`, `GP`, `GS`, and `GV`.
 
-Important caveat: `counter_bijection.json` contains only observed metadata pins, while `counter_bijection_extrapolated.json` fills the missing pair IDs by pattern extrapolation. The extrapolated file is the one to use for whole-payload decode tests. `anchors.json` reflects an older payload-anchor route and conflicts with the count-up bijection, so do not combine it with `counter_bijection_extrapolated.json` unless intentionally investigating the contradiction.
+Important caveat: `counter_bijection.json` contains only observed metadata pins, while `counter_bijection_extrapolated.json` fills the missing pair IDs by pattern extrapolation. The extrapolated file is the one to use for whole-payload decode tests.
 
 The CLI supports investigation as well as decoding. `--info` summarizes frame structure and byte distributions, `--find-runs` finds likely anchor candidates, `--check-anchors` validates anchor consistency, and `--trace-decode` prints one line per 4 input bytes showing field type, raw bytes, byte-to-nibble order, pair IDs, nibbles, decoded word, output bytes, and notes such as frame header, data, metadata, or tag.
 
@@ -62,14 +62,13 @@ The CLI supports investigation as well as decoding. `--info` summarizes frame st
 
 ```bash
 # Decode using the count-up bijection candidate.
-# dsp56800e_decoder_2.py supports --bijection-json direct pins.
-python3 dsp56800e_decoder_2.py firmware.elf.e --skip 13 \
+python3 dsp56800e_decoder.py firmware.elf.e --skip 13 \
     --bijection-json counter_bijection_extrapolated.json \
     --nibble-order 0123 \
-    -o decoded_counter.bin
+    -o decoded.bin
 ```
 
 ```bash
-hexdump -Cv decoded_counter.bin | head -100
-hexdump -Cv decoded_counter.bin | rg '41 43|41 44|41 46|47 56'
+hexdump -Cv decoded.bin | head -100
+hexdump -Cv decoded.bin | rg '41 43|41 44|41 46|47 56'
 ```
