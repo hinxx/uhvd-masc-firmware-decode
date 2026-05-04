@@ -54,7 +54,7 @@ python3 generate_counter_bijection.py firmware-no-header.elf.e > counter_bijecti
 
 The count-up metadata bijection is also the strongest whole-file payload decode candidate found so far. Using `counter_bijection_extrapolated.json` as direct pair-ID pins for the payload decoder with `--nibble-order 0123` produces plausible decoded output. The first decoded bytes are ASCII `PROGRAM&DATA`, and later decoded data contains two-letter ASCII host command mnemonics matching the command table in `docs/Host-Command-Reference_920-0002V.pdf`, such as `AC`, `AD`, `AF`, `AG`, `AI`, `AM`, `AO`, `AP`, `AS`, `AT`, `AV`, `BD`, `BE`, `BO`, `BR`, `CC`, `CD`, `CF`, `CG`, `CI`, `CM`, `CS`, `DA`, `DB`, `DE`, `DF`, `DL`, `DM`, `DR`, `ED`, `EF`, `EI`, `ES`, `FI`, `FX`, `GC`, `GD`, `GI`, `GL`, `GP`, `GS`, and `GV`.
 
-Important caveat: `counter_bijection.json` contains only observed metadata pins, while `counter_bijection_extrapolated.json` fills the missing pair IDs by pattern extrapolation. The extrapolated file is the one to use for whole-payload decode tests.
+Important caveat: `counter_bijection.json` contains only observed metadata pins, while `counter_bijection_extrapolated.json` fills the missing pair IDs by pattern extrapolation. The extrapolated file is the one to use for whole-payload decode tests. If `counter_bijection.json` the `counter_bijection_extrapolated.json` needs updating, too.
 
 The CLI supports investigation as well as decoding. `--info` summarizes frame structure and byte distributions, `--find-runs` finds constant codeword runs, `--find-value` checks values against direct bijection pins, and `--inspect` prints pair IDs around selected codeword indices.
 
@@ -66,9 +66,10 @@ python3 dsp56800e_decoder.py firmware.elf.e --skip 13 \
     --bijection-json counter_bijection_extrapolated.json \
     --nibble-order 0123 \
     -o decoded.bin
+hexdump -Cv decoded.bin > decoded.txt
 ```
 
 ```bash
-hexdump -Cv decoded.bin | head -100
+# Show some matching commands.
 hexdump -Cv decoded.bin | rg '41 43|41 44|41 46|47 56'
 ```
